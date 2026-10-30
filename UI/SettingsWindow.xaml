@@ -1,0 +1,124 @@
+<Window x:Class="Desko.UI.SettingsWindow"
+        x:ClassModifier="internal"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Cài đặt Desko" Width="640" Height="720" MinWidth="520" MinHeight="420"
+        WindowStartupLocation="CenterScreen" FontFamily="Segoe UI" FontSize="13">
+    <Window.Resources>
+        <ResourceDictionary Source="WindowStyles.xaml"/>
+    </Window.Resources>
+
+    <ScrollViewer VerticalScrollBarVisibility="Auto">
+        <StackPanel Margin="28,20,28,28">
+            <TextBlock Text="Cài đặt" Style="{StaticResource Heading}"/>
+            <TextBlock Text="Mọi thay đổi được áp dụng ngay lên các fence." Foreground="{DynamicResource FgSubtle}"/>
+
+            <!-- Appearance -->
+            <TextBlock Text="Giao diện" Style="{StaticResource SectionTitle}"/>
+            <Border Style="{StaticResource CardStyle}">
+                <StackPanel>
+                    <TextBlock Text="Nền fence" Margin="0,4,0,8"/>
+                    <WrapPanel x:Name="BackdropChoices">
+                        <RadioButton Content="Kính mờ (Acrylic)" Tag="Acrylic" GroupName="backdrop" Checked="Backdrop_Checked"/>
+                        <RadioButton Content="Làm mờ (Blur)" Tag="Blur" GroupName="backdrop" Checked="Backdrop_Checked"/>
+                        <RadioButton Content="Trong suốt" Tag="Clear" GroupName="backdrop" Checked="Backdrop_Checked"/>
+                    </WrapPanel>
+                    <TextBlock Text="Nếu kéo fence thấy giật, hãy thử “Làm mờ”." Foreground="{DynamicResource FgSubtle}" FontSize="12" Margin="0,6,0,6"/>
+                </StackPanel>
+            </Border>
+            <Border Style="{StaticResource CardStyle}">
+                <StackPanel>
+                    <TextBlock Text="Màu nền của mọi fence" Margin="0,4,0,8"/>
+                    <WrapPanel x:Name="ColorChoices">
+                        <RadioButton Content="Theo Windows" Tag="auto" GroupName="color" Checked="Color_Checked"/>
+                        <RadioButton Content="Màu nhấn" Tag="accent" GroupName="color" Checked="Color_Checked"/>
+                        <RadioButton Content="Đen" Tag="#000000" GroupName="color" Checked="Color_Checked"/>
+                        <RadioButton Content="Xanh dương" Tag="#1E4E8C" GroupName="color" Checked="Color_Checked"/>
+                        <RadioButton Content="Xanh ngọc" Tag="#0F6B6B" GroupName="color" Checked="Color_Checked"/>
+                        <RadioButton Content="Tím" Tag="#4B2A7B" GroupName="color" Checked="Color_Checked"/>
+                    </WrapPanel>
+                    <Grid Margin="0,14,0,4">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="44"/>
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Text="Độ đậm nền" VerticalAlignment="Center" Margin="0,0,14,0"/>
+                        <Slider x:Name="OpacitySlider" Grid.Column="1" Minimum="0.05" Maximum="0.95" SmallChange="0.05" LargeChange="0.1"
+                                IsSnapToTickEnabled="True" TickFrequency="0.05" VerticalAlignment="Center" ValueChanged="Opacity_Changed"/>
+                        <TextBlock x:Name="OpacityText" Grid.Column="2" TextAlignment="Right" VerticalAlignment="Center"/>
+                    </Grid>
+                </StackPanel>
+            </Border>
+            <Border Style="{StaticResource CardStyle}">
+                <StackPanel>
+                    <TextBlock Text="Cỡ icon trong mọi fence" Margin="0,4,0,8"/>
+                    <WrapPanel x:Name="IconChoices">
+                        <RadioButton x:Name="IconFollowDesktop" Content="Giống desktop" Tag="0" GroupName="icon" Checked="Icon_Checked"/>
+                        <RadioButton Content="Nhỏ" Tag="32" GroupName="icon" Checked="Icon_Checked"/>
+                        <RadioButton Content="Vừa" Tag="48" GroupName="icon" Checked="Icon_Checked"/>
+                        <RadioButton Content="Lớn" Tag="64" GroupName="icon" Checked="Icon_Checked"/>
+                        <RadioButton Content="Rất lớn" Tag="96" GroupName="icon" Checked="Icon_Checked"/>
+                    </WrapPanel>
+                </StackPanel>
+            </Border>
+            <Border Style="{StaticResource CardStyle}">
+                <StackPanel>
+                    <CheckBox x:Name="GpuRendering" Content="Tăng tốc bằng card đồ họa" Click="Gpu_Click"/>
+                    <TextBlock Text="Tốn thêm khoảng 60 MB RAM. Có hiệu lực sau khi khởi động lại ứng dụng."
+                               Foreground="{DynamicResource FgSubtle}" FontSize="12" Margin="0,0,0,4"/>
+                </StackPanel>
+            </Border>
+
+            <!-- Behaviour -->
+            <TextBlock Text="Hành vi" Style="{StaticResource SectionTitle}"/>
+            <Border Style="{StaticResource CardStyle}">
+                <StackPanel x:Name="BehaviourToggles"/>
+            </Border>
+
+            <!-- Hotkeys -->
+            <TextBlock Text="Phím tắt" Style="{StaticResource SectionTitle}"/>
+            <Border Style="{StaticResource CardStyle}">
+                <Grid Margin="0,4">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="150"/>
+                        <ColumnDefinition Width="*"/>
+                    </Grid.ColumnDefinitions>
+                    <Grid.RowDefinitions>
+                        <RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/>
+                    </Grid.RowDefinitions>
+                    <TextBlock Grid.Row="0" Text="Ctrl + Alt + F" FontWeight="SemiBold" Margin="0,3"/>
+                    <TextBlock Grid.Row="0" Grid.Column="1" Text="Tìm trong mọi fence" Margin="0,3"/>
+                    <TextBlock Grid.Row="1" Text="Ctrl + Alt + D" FontWeight="SemiBold" Margin="0,3"/>
+                    <TextBlock Grid.Row="1" Grid.Column="1" Text="Nhìn trộm: đưa các fence lên trên mọi cửa sổ" Margin="0,3"/>
+                    <TextBlock Grid.Row="2" Text="Gõ chữ trong fence" FontWeight="SemiBold" Margin="0,3"/>
+                    <TextBlock Grid.Row="2" Grid.Column="1" Text="Lọc icon trong fence đó (Esc để xóa)" Margin="0,3"/>
+                    <TextBlock Grid.Row="3" Text="F2" FontWeight="SemiBold" Margin="0,3"/>
+                    <TextBlock Grid.Row="3" Grid.Column="1" Text="Đổi tên ngay tại icon" Margin="0,3"/>
+                    <TextBlock Grid.Row="4" Text="Ctrl + Z" FontWeight="SemiBold" Margin="0,3"/>
+                    <TextBlock Grid.Row="4" Grid.Column="1" Text="Hoàn tác thao tác với fence" Margin="0,3"/>
+                    <TextBlock Grid.Row="5" Text="Backspace" FontWeight="SemiBold" Margin="0,3"/>
+                    <TextBlock Grid.Row="5" Grid.Column="1" Text="Quay lại thư mục trước trong Folder Portal" Margin="0,3"/>
+                </Grid>
+            </Border>
+
+            <!-- Startup -->
+            <TextBlock Text="Khởi động" Style="{StaticResource SectionTitle}"/>
+            <Border Style="{StaticResource CardStyle}">
+                <CheckBox x:Name="AutoStartToggle" Content="Khởi động cùng Windows" Click="AutoStart_Click"/>
+            </Border>
+
+            <!-- About -->
+            <TextBlock Text="Giới thiệu" Style="{StaticResource SectionTitle}"/>
+            <Border Style="{StaticResource CardStyle}">
+                <StackPanel>
+                    <TextBlock x:Name="VersionText" Margin="0,4,0,10"/>
+                    <WrapPanel>
+                        <Button Content="Xem lại hướng dẫn" Click="Welcome_Click" Margin="0,0,8,6"/>
+                        <Button Content="Mở thư mục dữ liệu" Click="DataFolder_Click" Margin="0,0,8,6"/>
+                    </WrapPanel>
+                </StackPanel>
+            </Border>
+        </StackPanel>
+    </ScrollViewer>
+</Window>

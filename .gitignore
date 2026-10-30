@@ -1,0 +1,14 @@
+# Build output (any project)
+bin/
+obj/
+*.pdb
+
+# Packaged app (build.ps1) and old self-contained packages
+dist/
+release/
+
+# IDE
+.vs/
+.vscode/
+*.user
+*.suo

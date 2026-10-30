@@ -1,0 +1,47 @@
+DESKO - SẮP XẾP DESKTOP BẰNG CÁC "FENCE"
+==============================================
+
+CÀI ĐẶT
+1. Giải nén toàn bộ file zip ra một thư mục.
+2. Nhấp đúp setup.bat và làm theo hướng dẫn trên màn hình.
+   - Nếu máy chưa có .NET 8 Desktop Runtime, setup sẽ tự tải và cài
+     (Windows hỏi quyền quản trị: chọn Yes).
+   - Nếu Windows hiện "Windows protected your PC": bấm "More info" -> "Run anyway".
+3. Ứng dụng được cài vào %LOCALAPPDATA%\Programs\Desko, có shortcut trong menu Start.
+   Lần đầu chạy sẽ có hướng dẫn ngắn và đề nghị tạo sẵn vài fence từ desktop của bạn.
+
+Cài bản mới: chạy setup.bat của bản mới, nó tự tắt bản cũ và cài đè, giữ nguyên các fence.
+
+SỬ DỤNG
+- Tạo fence: giữ chuột phải và kéo một khung trên vùng trống của desktop -> "Tạo Fence tại đây".
+- Cho file vào fence: kéo icon trên desktop thả vào fence. Kéo ra lại desktop để bỏ khỏi fence.
+- Thả lên giữa một thư mục trong fence: file vào thẳng thư mục đó.
+- Chọn nhiều file: kéo khung từ chỗ trống bên trong fence (giữ Ctrl để chọn thêm).
+- Nhấp đúp vùng trống desktop: ẩn / hiện tất cả fence.
+- Nhấp đúp thanh tiêu đề fence: thu gọn / mở ra (rê chuột vào để xem nhanh).
+- Kéo mép fence để đổi kích thước (tự căn vừa số icon).
+- Kéo một fence thả lên fence khác: gộp thành các tab.
+- Folder Portal: fence hiển thị một thư mục; nhấp đúp thư mục con để duyệt, Backspace để quay lại.
+- Chuột phải lên fence: đổi tên, màu, thêm tab, quy tắc tự sắp xếp, xóa fence...
+
+PHÍM TẮT
+- Ctrl + Alt + F   Tìm trong mọi fence (Enter mở, Ctrl+Enter chỉ vị trí trong fence)
+- Ctrl + Alt + D   Nhìn trộm: đưa mọi fence lên trên các cửa sổ
+- Gõ chữ trong fence   Lọc icon (không cần gõ dấu; Esc để xóa)
+- F2               Đổi tên ngay tại icon
+- Ctrl + Z         Hoàn tác thao tác với fence (xóa, gộp, tách tab...)
+
+CÀI ĐẶT ỨNG DỤNG
+- Mở lại Desko (menu Start) khi nó đang chạy, hoặc chuột phải icon khay -> Cài đặt…
+- Mọi thay đổi (nền kính mờ, màu, độ đậm, cỡ icon...) áp dụng ngay lên các fence.
+
+AN TOÀN DỮ LIỆU
+- File KHÔNG bị di chuyển hay xóa: chúng vẫn nằm trên Desktop, ứng dụng chỉ tạm ẩn
+  icon khỏi desktop để hiển thị trong fence.
+- Thoát ứng dụng (chuột phải icon khay -> Thoát) thì mọi file hiện lại trên desktop.
+  Kể cả khi ứng dụng bị tắt đột ngột, file cũng tự hiện lại.
+- Xóa fence chỉ gỡ khung, file vẫn còn nguyên trên desktop.
+
+GỠ CÀI ĐẶT
+Chạy uninstall.bat trong %LOCALAPPDATA%\Programs\Desko
+(mọi file được trả về desktop, bỏ khởi động cùng Windows, xóa ứng dụng).

@@ -1,0 +1,41 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>assets\desko.ico</ApplicationIcon>
+    <AssemblyName>Desko</AssemblyName>
+    <RootNamespace>Desko</RootNamespace>
+    <StartupObject>Desko.Program</StartupObject>
+    <Version>2.0.0</Version>
+    <Description>Organize the Windows desktop into fences.</Description>
+    <Authors>doson709</Authors>
+    <Copyright>Copyright (c) doson709</Copyright>
+    <RepositoryUrl>https://github.com/doson709/Desko</RepositoryUrl>
+    <Product>Desko</Product>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <!-- Precompiled code: less JIT work at startup, which matters most right after logon. -->
+    <PublishReadyToRun>true</PublishReadyToRun>
+    <TieredPGO>true</TieredPGO>
+    <!-- A small background app: no background-GC thread, and prefer returning memory over keeping it. -->
+    <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <RuntimeHostConfigurationOption Include="System.GC.ConserveMemory" Value="5" />
+  </ItemGroup>
+
+  <!-- The watchdog is its own (Native AOT) project. -->
+  <ItemGroup>
+    <Compile Remove="Guard\**" />
+    <None Remove="Guard\**" />
+    <Page Remove="Guard\**" />
+  </ItemGroup>
+
+</Project>

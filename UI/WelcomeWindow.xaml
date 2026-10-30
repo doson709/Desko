@@ -1,0 +1,60 @@
+<Window x:Class="Desko.UI.WelcomeWindow"
+        x:ClassModifier="internal"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Chào mừng đến Desko" Width="560" Height="460" ResizeMode="NoResize"
+        WindowStartupLocation="CenterScreen" FontFamily="Segoe UI" FontSize="14">
+    <Window.Resources>
+        <ResourceDictionary Source="WindowStyles.xaml"/>
+    </Window.Resources>
+
+    <Grid Margin="32,24,32,24">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <!-- One page visible at a time; the code-behind steps through them. -->
+        <Grid x:Name="Pages">
+            <StackPanel>
+                <TextBlock Text="&#xE80F;" FontFamily="Segoe MDL2 Assets" FontSize="40" Foreground="{DynamicResource Accent}" Margin="0,8,0,16"/>
+                <TextBlock Text="Chào mừng đến Desko" Style="{StaticResource Heading}"/>
+                <TextBlock Text="Gom icon trên desktop vào các khung gọn gàng gọi là fence. File của bạn vẫn nằm nguyên trên Desktop: Desko chỉ hiển thị chúng trong fence, không di chuyển hay xóa gì."
+                           Foreground="{DynamicResource FgSubtle}" LineHeight="22"/>
+            </StackPanel>
+            <StackPanel Visibility="Collapsed">
+                <TextBlock Text="&#xE8A9;" FontFamily="Segoe MDL2 Assets" FontSize="40" Foreground="{DynamicResource Accent}" Margin="0,8,0,16"/>
+                <TextBlock Text="Tạo fence" Style="{StaticResource Heading}"/>
+                <TextBlock Text="Giữ chuột phải và kéo một khung trên vùng trống của desktop, rồi chọn “Tạo Fence tại đây”. Kéo thanh tiêu đề để di chuyển, kéo mép để đổi kích thước: fence tự căn vừa số icon."
+                           Foreground="{DynamicResource FgSubtle}" LineHeight="22"/>
+            </StackPanel>
+            <StackPanel Visibility="Collapsed">
+                <TextBlock Text="&#xE7C4;" FontFamily="Segoe MDL2 Assets" FontSize="40" Foreground="{DynamicResource Accent}" Margin="0,8,0,16"/>
+                <TextBlock Text="Dùng hằng ngày" Style="{StaticResource Heading}"/>
+                <TextBlock Foreground="{DynamicResource FgSubtle}" LineHeight="24">
+                    • Kéo icon vào fence; kéo ra desktop để bỏ khỏi fence.<LineBreak/>
+                    • Nhấp đúp vùng trống desktop: ẩn / hiện mọi fence.<LineBreak/>
+                    • Nhấp đúp thanh tiêu đề: thu gọn fence.<LineBreak/>
+                    • Ctrl + Alt + F: tìm trong mọi fence.  Ctrl + Alt + D: nhìn trộm.<LineBreak/>
+                    • Kéo fence thả lên fence khác để gộp thành tab.
+                </TextBlock>
+            </StackPanel>
+            <StackPanel Visibility="Collapsed">
+                <TextBlock Text="&#xE945;" FontFamily="Segoe MDL2 Assets" FontSize="40" Foreground="{DynamicResource Accent}" Margin="0,8,0,16"/>
+                <TextBlock Text="Bắt đầu" Style="{StaticResource Heading}"/>
+                <TextBlock Text="Desko có thể tạo sẵn vài fence (Thư mục, Tài liệu, Ảnh &amp; video, Ứng dụng) từ những gì đang có trên desktop của bạn. Bạn có thể đổi tên, gộp hoặc xóa chúng bất cứ lúc nào, hoặc hoàn tác bằng Ctrl + Z."
+                           Foreground="{DynamicResource FgSubtle}" LineHeight="22" Margin="0,0,0,16"/>
+                <CheckBox x:Name="AutoStartToggle" Content="Khởi động cùng Windows"/>
+            </StackPanel>
+        </Grid>
+
+        <Grid Grid.Row="1">
+            <StackPanel x:Name="Dots" Orientation="Horizontal" VerticalAlignment="Center"/>
+            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                <Button x:Name="BackButton" Content="Quay lại" Click="Back_Click" Margin="0,0,8,0"/>
+                <Button x:Name="SkipButton" Content="Tự sắp xếp sau" Click="Finish_Click" Margin="0,0,8,0" Visibility="Collapsed"/>
+                <Button x:Name="NextButton" Content="Tiếp" IsDefault="True" Click="Next_Click"/>
+            </StackPanel>
+        </Grid>
+    </Grid>
+</Window>
