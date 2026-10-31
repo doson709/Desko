@@ -17,7 +17,7 @@ if errorlevel 2 exit /b 0
 echo.
 echo [1/3] Tắt Desko và trả mọi file về desktop...
 if exist "%APP%" (
-    rem Thoát bình thường, hiện lại file đã ẩn, bỏ khởi động cùng Windows.
+    rem Thoát bình thường, trả các icon đang cất về desktop, bỏ khởi động cùng Windows.
     "%APP%" --uninstall
 )
 taskkill /im Desko.exe /f >nul 2>&1

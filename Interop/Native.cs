@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -17,6 +18,8 @@ namespace Desko.Interop
         public const int WM_MENUCHAR = 0x0120;
         public const int WM_MOUSEMOVE = 0x0200;
         public const int WM_LBUTTONDOWN = 0x0201;
+        public const int WM_LBUTTONUP = 0x0202;
+        public const int WM_MOUSEWHEEL = 0x020A;
         public const int WM_RBUTTONDOWN = 0x0204;
         public const int WM_RBUTTONUP = 0x0205;
         public const int WM_SIZING = 0x0214;
@@ -35,6 +38,7 @@ namespace Desko.Interop
         public const long WS_EX_APPWINDOW = 0x40000;
         public const long WS_EX_NOACTIVATE = 0x08000000;
 
+        public static readonly IntPtr HWND_TOP = IntPtr.Zero;
         public static readonly IntPtr HWND_BOTTOM = new IntPtr(1);
         public static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
         public const uint SWP_NOSIZE = 0x1, SWP_NOMOVE = 0x2, SWP_NOZORDER = 0x4, SWP_NOACTIVATE = 0x10, SWP_SHOWWINDOW = 0x40;
@@ -154,6 +158,7 @@ namespace Desko.Interop
         [DllImport("user32.dll")] public static extern IntPtr MonitorFromPoint(POINT pt, uint flags);
         [DllImport("user32.dll")] public static extern bool GetMonitorInfo(IntPtr monitor, ref MONITORINFO info);
         [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr hwnd);
+        [DllImport("user32.dll")] public static extern uint GetDpiForSystem();
         [DllImport("shcore.dll")] static extern int GetDpiForMonitor(IntPtr monitor, int type, out uint dpiX, out uint dpiY);
         [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT pt);
         [DllImport("user32.dll")] public static extern short GetKeyState(int vk);
@@ -243,6 +248,30 @@ namespace Desko.Interop
             return info.rcWork;
         }
 
+        delegate bool MonitorEnumProc(IntPtr monitor, IntPtr dc, ref RECT rect, IntPtr data);
+        [DllImport("user32.dll")] static extern bool EnumDisplayMonitors(IntPtr dc, IntPtr clip, MonitorEnumProc proc, IntPtr data);
+
+        public static List<RECT> MonitorRects()
+        {
+            var list = new List<RECT>();
+            EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, (IntPtr m, IntPtr dc, ref RECT r, IntPtr d) => { list.Add(r); return true; }, IntPtr.Zero);
+            return list;
+        }
+
+        public static List<RECT> WorkAreas()
+        {
+            var list = new List<RECT>();
+            EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, (IntPtr m, IntPtr dc, ref RECT r, IntPtr d) =>
+            {
+                var info = new MONITORINFO { cbSize = Marshal.SizeOf<MONITORINFO>() };
+                if (GetMonitorInfo(m, ref info)) list.Add(info.rcWork);
+                return true;
+            }, IntPtr.Zero);
+            return list;
+        }
+
+        public static bool Contains(RECT r, POINT p) => p.X >= r.Left && p.X < r.Right && p.Y >= r.Top && p.Y < r.Bottom;
+
         public static double ScaleForPoint(POINT pt)
         {
             try
@@ -256,9 +285,9 @@ namespace Desko.Interop
 
         [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
 
-        // Backdrop behind a (non-layered) fence window. The documented Mica/Acrylic system backdrops turn into
-        // a flat colour whenever the window is inactive – and a fence almost always is – so this uses the
-        // accent policy, which keeps blurring. "Acrylic" = frosted, "Blur" = plain blur, anything else = clear.
+        // Frosted backdrop behind a (non-layered) popup such as the search window. The documented Mica/Acrylic
+        // system backdrops turn into a flat colour whenever the window is inactive, so this uses the accent
+        // policy, which keeps blurring. "Acrylic" = frosted, "Blur" = plain blur, anything else = clear.
         public static void SetBackdrop(IntPtr hwnd, string mode, bool darkFrame)
         {
             int state = mode switch { "Acrylic" => 4, "Blur" => 3, _ => 2 };
@@ -277,7 +306,6 @@ namespace Desko.Interop
             try
             {
                 // DWMWCP_DONOTROUND: Windows 11 draws a drop shadow (and a 1px frame) around every window it rounds.
-                // Fences are rounded by their window region instead (FenceWindow.UpdateRegion), with no shadow.
                 int round = 1;
                 DwmSetWindowAttribute(hwnd, 33, ref round, sizeof(int));
                 int dark = darkFrame ? 1 : 0; // DWMWA_USE_IMMERSIVE_DARK_MODE: border tone

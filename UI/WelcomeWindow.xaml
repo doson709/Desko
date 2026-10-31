@@ -19,7 +19,7 @@
             <StackPanel>
                 <TextBlock Text="&#xE80F;" FontFamily="Segoe MDL2 Assets" FontSize="40" Foreground="{DynamicResource Accent}" Margin="0,8,0,16"/>
                 <TextBlock Text="Chào mừng đến Desko" Style="{StaticResource Heading}"/>
-                <TextBlock Text="Gom icon trên desktop vào các khung gọn gàng gọi là fence. File của bạn vẫn nằm nguyên trên Desktop: Desko chỉ hiển thị chúng trong fence, không di chuyển hay xóa gì."
+                <TextBlock Text="Gom icon trên desktop vào các khung gọn gàng gọi là fence. Fence chứa chính các icon của desktop: file vẫn nằm nguyên trên Desktop, không bị di chuyển, ẩn hay xóa, và vẫn thấy đầy đủ trong File Explorer."
                            Foreground="{DynamicResource FgSubtle}" LineHeight="22"/>
             </StackPanel>
             <StackPanel Visibility="Collapsed">
@@ -35,7 +35,7 @@
                     • Kéo icon vào fence; kéo ra desktop để bỏ khỏi fence.<LineBreak/>
                     • Nhấp đúp vùng trống desktop: ẩn / hiện mọi fence.<LineBreak/>
                     • Nhấp đúp thanh tiêu đề: thu gọn fence.<LineBreak/>
-                    • Ctrl + Alt + F: tìm trong mọi fence.  Ctrl + Alt + D: nhìn trộm.<LineBreak/>
+                    • Ctrl + Alt + F: tìm trong mọi fence.  Ctrl + Alt + D: xem desktop.<LineBreak/>
                     • Kéo fence thả lên fence khác để gộp thành tab.
                 </TextBlock>
             </StackPanel>

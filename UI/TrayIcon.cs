@@ -55,14 +55,15 @@ namespace Desko.UI
             _mgr = mgr;
             var cfg = mgr.Config;
             _toggles.Add(("Nhấp đúp desktop để ẩn / hiện fence", () => cfg.DoubleClickToHide, v => cfg.DoubleClickToHide = v));
-            _toggles.Add(("Ẩn luôn icon desktop khi ẩn fence", () => cfg.HideIconsToo, v => cfg.HideIconsToo = v));
+            _toggles.Add(("Tự xếp gọn icon ngoài fence (Auto arrange)", () => cfg.ArrangesLooseIcons, v => cfg.AutoArrangeLoose = v));
+            _toggles.Add(("Căn icon ngoài fence theo lưới", () => cfg.AlignLooseIcons, v => cfg.AlignLooseIcons = v));
             _toggles.Add(("Kéo chuột phải trên desktop để tạo fence", () => cfg.RightDragToCreate, v => cfg.RightDragToCreate = v));
             _toggles.Add(("Tự động xếp file mới trên desktop theo quy tắc", () => cfg.AutoApplyRules, v =>
             {
                 cfg.AutoApplyRules = v;
                 if (v) _mgr.TidyDesktop(null, quiet: false);
             }));
-            _toggles.Add(("Mở file bằng một cú nhấp", () => cfg.SingleClickOpen, v => cfg.SingleClickOpen = v));
+            _toggles.Add(("Mở file bằng một cú nhấp (Folder Portal)", () => cfg.SingleClickOpen, v => cfg.SingleClickOpen = v));
             _toggles.Add(("Bắt dính lưới khi di chuyển", () => cfg.SnapToGrid, v => cfg.SnapToGrid = v));
             _toggles.Add(("Nền kính mờ Acrylic", () => cfg.Backdrop == "Acrylic", _ => cfg.Backdrop = "Acrylic"));
             _toggles.Add(("Nền làm mờ (Blur)", () => cfg.Backdrop == "Blur", _ => cfg.Backdrop = "Blur"));
@@ -129,7 +130,7 @@ namespace Desko.UI
 
         void ShowMenu()
         {
-            const int CmdNew = 1, CmdToggle = 2, CmdTidy = 3, CmdSettings = 4, CmdUndo = 5, CmdSearch = 6, CmdPeek = 7, CmdExit = 9, CmdToggleBase = 100;
+            const int CmdNew = 1, CmdToggle = 2, CmdTidy = 3, CmdSettings = 4, CmdUndo = 5, CmdSearch = 6, CmdPeek = 7, CmdArrange = 8, CmdExit = 9, CmdToggleBase = 100;
             IntPtr menu = Native.CreatePopupMenu(), settings = Native.CreatePopupMenu();
             try
             {
@@ -146,8 +147,9 @@ namespace Desko.UI
                 AppendMenu(menu, MF_STRING, (UIntPtr)CmdNew, "Tạo fence mới");
                 AppendMenu(menu, MF_STRING, (UIntPtr)CmdToggle, "Ẩn / hiện tất cả fence");
                 AppendMenu(menu, MF_STRING, (UIntPtr)CmdTidy, "Dọn desktop theo quy tắc");
+                AppendMenu(menu, MF_STRING, (UIntPtr)CmdArrange, "Xếp gọn icon ngoài fence");
                 AppendMenu(menu, MF_STRING, (UIntPtr)CmdSearch, "Tìm trong các fence\tCtrl+Alt+F");
-                AppendMenu(menu, MF_STRING, (UIntPtr)CmdPeek, "Nhìn trộm fence\tCtrl+Alt+D");
+                AppendMenu(menu, MF_STRING, (UIntPtr)CmdPeek, "Xem desktop\tCtrl+Alt+D");
                 AppendMenu(menu, MF_SEPARATOR, UIntPtr.Zero, null);
                 AppendMenu(menu, MF_POPUP, (UIntPtr)(ulong)settings, "Cài đặt nhanh");
                 AppendMenu(menu, MF_STRING, (UIntPtr)CmdSettings, "Cài đặt…");
@@ -168,10 +170,11 @@ namespace Desko.UI
                         int n = _mgr.TidyDesktop(null, quiet: false);
                         ShowTip("Desko", n > 0 ? $"Đã xếp {n} mục vào fence." : "Không có mục nào khớp quy tắc của các fence.");
                         break;
+                    case CmdArrange: _mgr.ArrangeLooseIcons(); break;
                     case CmdSettings: _mgr.ShowSettings(); break;
                     case CmdUndo: _mgr.Undo(); break;
                     case CmdSearch: _mgr.ShowGlobalSearch(); break;
-                    case CmdPeek: _mgr.BeginPeek(); break;
+                    case CmdPeek: FenceManager.ToggleDesktop(); break;
                     case CmdExit: Application.Current.Shutdown(); break;
                     case >= CmdToggleBase when cmd - CmdToggleBase < _toggles.Count:
                         var toggle = _toggles[cmd - CmdToggleBase];

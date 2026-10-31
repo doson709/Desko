@@ -26,7 +26,9 @@ namespace Desko.UI
     {
         const double TitleHeightDip = 28;
         const int CmdMoveToDesktop = 0x7F01;
-        const int WM_SIZE = 0x0005, WM_SETTINGCHANGE = 0x001A, WM_DWMCOLORIZATIONCOLORCHANGED = 0x0320, WM_DISPLAYCHANGE = 0x007E;
+        const int WM_SETTINGCHANGE = 0x001A, WM_DWMCOLORIZATIONCOLORCHANGED = 0x0320, WM_DISPLAYCHANGE = 0x007E;
+        const int WM_WINDOWPOSCHANGED = 0x0047, SPI_SETDESKWALLPAPER = 0x0014;
+        static readonly Brush HitBrush = Brush(Color.FromArgb(1, 0, 0, 0)); // invisible, but takes the mouse
         static readonly int WM_TASKBARCREATED = (int)Native.RegisterWindowMessage("TaskbarCreated");
 
         static readonly (string Name, string Hex)[] ColorPresets =
@@ -51,6 +53,7 @@ namespace Desko.UI
         {
             _mgr = mgr;
             Config = config;
+            ZoneId = mgr.NewZoneId();
             InitializeComponent();
             Items.ItemsSource = _items;
             Items.LostMouseCapture += (_, _) => EndMarquee();
@@ -70,7 +73,20 @@ namespace Desko.UI
                 if (!_mgr.Hidden) FadeTo(1);
                 if (PendingRename) { PendingRename = false; BeginRename(); }
             };
-            Closed += (_, _) => { StopWatcher(); _reloadTimer.Stop(); _peekTimer.Stop(); };
+            Closed += (_, _) =>
+            {
+                StopWatcher();
+                _reloadTimer.Stop();
+                _peekTimer.Stop();
+                StopFade();
+                _backdrop?.Dispose();
+                _backdrop = null;
+            };
+            IsVisibleChanged += (_, _) =>
+            {
+                _backdrop?.SetVisible(IsVisible);
+                _mgr.UpdateZones();
+            };
 
             DragEnter += Window_DragEnter;
             DragOver += Window_DragOver;
@@ -95,6 +111,16 @@ namespace Desko.UI
         public bool ClosingByManager { get; set; }
         public bool PendingRename { get; set; }
 
+        // Normal fences hold desktop icons; folder portals show a folder themselves.
+        public bool IsDesktopFence => !Config.IsPortal;
+        // Identifies this fence to the mouse hook.
+        public int ZoneId { get; }
+
+        FenceBackdrop? _backdrop;
+        FenceBackdrop.Look? _look;
+        bool _glow;
+        Native.RECT? _spot;
+
         double DpiScale => Handle != IntPtr.Zero ? Native.GetDpiForWindow(Handle) / 96.0 : 1.0;
         int TitleHeightPx => (int)Math.Round((TitleHeightDip + 2) * DpiScale);
 
@@ -105,9 +131,9 @@ namespace Desko.UI
             Handle = new WindowInteropHelper(this).Handle;
             var source = HwndSource.FromHwnd(Handle)!;
             source.AddHook(WndProc);
-            // Transparent surface so the DWM backdrop shows through wherever WPF draws nothing opaque.
-            source.CompositionTarget.BackgroundColor = Colors.Transparent;
             Native.AddExStyle(Handle, Native.WS_EX_TOOLWINDOW, Native.WS_EX_APPWINDOW);
+            _backdrop = new FenceBackdrop();
+            _backdrop.SetAlpha(0); // fades in with the window
             AttachToDesktop();
             ApplyBounds();
             ApplyAppearance();
@@ -115,8 +141,8 @@ namespace Desko.UI
             Reload();
         }
 
-        // Owned by Progman: stays on the desktop layer and survives Win+D / "Show desktop".
-        void AttachToDesktop()
+        // Owned by Progman: stays on the desktop layer (just above the icons) and survives Win+D / "Show desktop".
+        public void AttachToDesktop()
         {
             var progman = DesktopShell.Progman;
             if (progman != IntPtr.Zero) Native.SetWindowLongPtr(Handle, Native.GWLP_HWNDPARENT, progman);
@@ -137,25 +163,37 @@ namespace Desko.UI
                 case Native.WM_WINDOWPOSCHANGING:
                 {
                     var pos = Marshal.PtrToStructure<Native.WINDOWPOS>(lParam);
-                    if ((pos.flags & Native.SWP_NOZORDER) == 0 && !_peekTop)
+                    if ((pos.flags & Native.SWP_NOZORDER) == 0)
                     {
                         pos.hwndInsertAfter = Native.HWND_BOTTOM;
                         Marshal.StructureToPtr(pos, lParam, false);
                     }
                     break;
                 }
+                case WM_WINDOWPOSCHANGED:
+                {
+                    var pos = Marshal.PtrToStructure<Native.WINDOWPOS>(lParam);
+                    if ((pos.flags & (Native.SWP_NOMOVE | Native.SWP_NOSIZE)) != (Native.SWP_NOMOVE | Native.SWP_NOSIZE))
+                        BoundsChanged();
+                    break;
+                }
                 case Native.WM_ENTERSIZEMOVE:
+                    Log.Trace($"fence \"{Config.Title}\": move loop starts");
                     _inSizeMove = true;
                     _moveOthers = _mgr.GetOtherRects(this);
-                    _moveStartRect = ScreenRect;
-                    Native.GetCursorPos(out _moveStartCursor);
+                    _moveStartRect = _pressAnchored ? _pressRect : ScreenRect;
+                    if (_pressAnchored) _moveStartCursor = _pressCursor;
+                    else Native.GetCursorPos(out _moveStartCursor);
                     break;
                 case Native.WM_EXITSIZEMOVE:
                 {
+                    Log.Trace($"fence \"{Config.Title}\": move loop ends");
                     _inSizeMove = false;
                     if (_mergeTarget is FenceWindow target)
                     {
                         SetMergeTarget(null);
+                        EndLift();
+                        UpdateBackdrop();
                         // Ask after the move loop has fully ended.
                         Dispatcher.BeginInvoke(() => AskMerge(target));
                         break;
@@ -166,7 +204,10 @@ namespace Desko.UI
                     Snapper.SnapMove(ref r, _moveOthers, Native.WorkAreaFromRect(r), (int)(12 * s), GridPx(s), (int)(8 * s));
                     Native.SetWindowPos(Handle, IntPtr.Zero, r.Left, r.Top, 0, 0,
                         Native.SWP_NOSIZE | Native.SWP_NOZORDER | Native.SWP_NOACTIVATE);
+                    EndLift();
+                    UpdateBackdrop(); // repainted for where it landed
                     SaveBounds();
+                    _mgr.FenceMoveEnded(); // icons it now covers make room
                     break;
                 }
                 case Native.WM_MOVING:
@@ -182,6 +223,12 @@ namespace Desko.UI
                     double s = DpiScale;
                     Snapper.SnapMove(ref r, _moveOthers, Native.WorkAreaFromRect(r), (int)(10 * s), 0, (int)(8 * s));
                     Marshal.StructureToPtr(r, lParam, false);
+                    if (!_movedOnce) { _movedOnce = true; Log.Trace($"fence \"{Config.Title}\": first move"); }
+                    // The icons ride along on this window; the backdrop is put at the same place right now,
+                    // so all three layers arrive on screen together.
+                    BeginLift();
+                    ParkLifted("fence moved");
+                    _backdrop?.MoveTo(r);
                     SetMergeTarget(_mgr.WindowAt(cursor, this));
                     if (_mergeTarget != null) CursorHintWindow.ShowAt("Thả để gộp thành tab", highlight: true);
                     handled = true;
@@ -192,11 +239,11 @@ namespace Desko.UI
                     if (!_inSizeMove)
                         Dispatcher.BeginInvoke(DispatcherPriority.Background, () => { ApplyBounds(); Reload(); });
                     break;
-                case WM_SIZE:
-                    UpdateRegion(lParam.ToInt32() & 0xFFFF, (lParam.ToInt32() >> 16) & 0xFFFF);
-                    break;
                 case WM_DISPLAYCHANGE:
                     _mgr.DisplayChanged();
+                    break;
+                case WM_SETTINGCHANGE when wParam.ToInt32() == SPI_SETDESKWALLPAPER:
+                    _mgr.WallpaperChanged();
                     break;
                 case WM_SETTINGCHANGE when lParam != IntPtr.Zero && Marshal.PtrToStringUni(lParam) == "ImmersiveColorSet":
                 case WM_DWMCOLORIZATIONCOLORCHANGED:
@@ -205,24 +252,46 @@ namespace Desko.UI
                     ApplyAppearance();
                     break;
                 default:
-                    if (msg == WM_TASKBARCREATED) AttachToDesktop();
+                    if (msg == WM_TASKBARCREATED)
+                    {
+                        AttachToDesktop();
+                        _mgr.ExplorerRestarted();
+                    }
                     break;
             }
             return IntPtr.Zero;
         }
 
-        [DllImport("gdi32.dll")] static extern IntPtr CreateRoundRectRgn(int left, int top, int right, int bottom, int w, int h);
-        [DllImport("user32.dll")] static extern int SetWindowRgn(IntPtr hwnd, IntPtr region, bool redraw);
+        int GridPx(double scale) => _mgr.Config.SnapToGrid ? (int)Math.Round(_mgr.Config.GridSize * scale) : 0;
 
-        // Rounded corners without the drop shadow Windows 11 adds to windows it rounds itself.
-        void UpdateRegion(int width, int height)
+        // Moved or resized (by the user, an animation, a display change): the backdrop follows at once,
+        // the icons once per frame.
+        bool _iconsQueued, _movedOnce;
+        Native.POINT _lastSize;
+
+        void BoundsChanged()
         {
-            if (width <= 0 || height <= 0) return;
-            int d = (int)Math.Round(16 * DpiScale); // 8px radius, like Windows 11
-            SetWindowRgn(Handle, CreateRoundRectRgn(0, 0, width + 1, height + 1, d, d), true); // the window owns the region
+            var r = ScreenRect;
+            bool resized = r.Width != _lastSize.X || r.Height != _lastSize.Y;
+            _lastSize = new Native.POINT(r.Width, r.Height);
+            // Being dragged: the backdrop moves along as it is (repainted once let go); otherwise it repaints.
+            if (_inSizeMove && !resized) _backdrop?.MoveTo(r);
+            else UpdateBackdrop();
+            if (_lifted && resized) { BuildProxy(); _proxyKey = null; }
+            if (_iconsQueued) return;
+            _iconsQueued = true;
+            Dispatcher.BeginInvoke(DispatcherPriority.Render, () =>
+            {
+                _iconsQueued = false;
+                if (Handle != IntPtr.Zero) _mgr.FenceBoundsChanged(this);
+            });
         }
 
-        int GridPx(double scale) => _mgr.Config.SnapToGrid ? (int)Math.Round(_mgr.Config.GridSize * scale) : 0;
+        void UpdateBackdrop()
+        {
+            if (_backdrop == null || _look == null || Handle == IntPtr.Zero) return;
+            _backdrop.Update(ScreenRect, _look with { Glow = _glow, Spot = _spot });
+        }
 
         #endregion
 
@@ -233,7 +302,9 @@ namespace Desko.UI
         const int EdgeLeft = 1, EdgeRight = 2, EdgeTop = 3, EdgeBottom = 6;
         int _resizeEdge;
         Native.RECT _resizeStartRect, _moveStartRect;
-        Native.POINT _resizeStartCursor, _moveStartCursor;
+        Native.POINT _resizeStartCursor, _moveStartCursor, _pressCursor;
+        Native.RECT _pressRect;
+        bool _pressAnchored;
         IReadOnlyList<Native.RECT> _moveOthers = Array.Empty<Native.RECT>();
 
         int EdgeAt(Point p)
@@ -268,6 +339,8 @@ namespace Desko.UI
             {
                 Native.GetCursorPos(out var pt);
                 int dx = pt.X - _resizeStartCursor.X, dy = pt.Y - _resizeStartCursor.Y;
+                if (LiftSettling) { e.Handled = true; return; } // see BeginLift
+                if (dx != 0 || dy != 0) ParkLifted("fence resized"); // the icons re-flow on this window while it is resized
                 var r = _resizeStartRect;
                 int edge = _resizeEdge;
                 if (edge is 1 or 4 or 7) r.Left += dx;
@@ -306,6 +379,7 @@ namespace Desko.UI
             int hover = e.LeftButton == MouseButtonState.Released ? EdgeAt(e.GetPosition(this)) : 0;
             Cursor = CursorFor(hover);
             ForceCursor = hover != 0;
+            if (hover != 0) PrepareLift();
         }
 
         void Resize_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
@@ -319,6 +393,7 @@ namespace Desko.UI
             _moveOthers = _mgr.GetOtherRects(this);
             MeasureCells();
             CaptureMouse();
+            BeginLift(); // see TitleBar_MouseLeftButtonDown
             e.Handled = true;
         }
 
@@ -327,19 +402,18 @@ namespace Desko.UI
         // Size of one icon cell and of everything around the icon area, measured from the live layout.
         void MeasureCells()
         {
-            double cw = 0, ch = 0;
-            for (int i = 0; i < _items.Count; i++)
+            if (IsDesktopFence)
             {
-                if (Items.ItemContainerGenerator.ContainerFromIndex(i) is not ListBoxItem c || !c.IsVisible) continue;
-                cw = Math.Max(cw, c.ActualWidth + c.Margin.Left + c.Margin.Right);
-                ch = Math.Max(ch, c.ActualHeight + c.Margin.Top + c.Margin.Bottom);
+                // The desktop's own icon grid.
+                double s = DpiScale;
+                var r = ScreenRect;
+                var area = IconArea(r);
+                _cellDip = new Size(IconGrid.Cell.X / s, IconGrid.Cell.Y / s);
+                _chromeDip = new Size((r.Width - area.Width) / s, (r.Height - area.Height) / s);
+                return;
             }
-            if (cw <= 0)
-            {
-                cw = IconSizeDip + 44;
-                ch = IconSizeDip + 46;
-            }
-            _cellDip = new Size(cw, ch);
+            // Portals use the same cells (see UpdateCellSize).
+            _cellDip = new Size(CellWidth, CellHeight);
 
             var sv = FindChild<ScrollViewer>(Items);
             double viewW = sv != null && sv.ViewportWidth > 0 ? sv.ViewportWidth : ActualWidth - 16;
@@ -408,15 +482,19 @@ namespace Desko.UI
             _cursorHint?.Hide();
             Cursor = null;
             ForceCursor = false;
+            EndLift();
             SaveBounds();
+            _mgr.FenceMoveEnded();
         }
+
+        bool Collapsed => Config.RolledUp && !_peeking;
 
         // animate: roll up / unfold smoothly when only the height changes.
         public void ApplyBounds(bool animate = false)
         {
             if (Handle == IntPtr.Zero) return;
             EnsureOnScreen();
-            int h = Config.RolledUp && !_peeking ? TitleHeightPx : Config.Height;
+            int h = Collapsed ? TitleHeightPx : Config.Height;
             var current = ScreenRect;
             StopHeightAnimation();
             if (animate && IsVisible && current.Left == Config.X && current.Top == Config.Y &&
@@ -481,15 +559,42 @@ namespace Desko.UI
             get { Native.GetWindowRect(Handle, out var r); return r; }
         }
 
-        // Fades the content (the backdrop of a non-layered window cannot fade with it).
+        // Fades the window and its backdrop together.
+        EventHandler? _fadeFrame;
+
         public void FadeTo(double target, Action? done = null)
         {
-            var anim = new DoubleAnimation(target, TimeSpan.FromMilliseconds(180))
+            StopFade();
+            double from = Root.Opacity;
+            var clock = Stopwatch.StartNew();
+            const double duration = 180;
+            _fadeFrame = (_, _) =>
             {
-                EasingFunction = new QuadraticEase { EasingMode = EasingMode.EaseOut },
+                double t = Math.Min(1, clock.Elapsed.TotalMilliseconds / duration);
+                double eased = 1 - (1 - t) * (1 - t); // ease-out quadratic
+                double value = from + (target - from) * eased;
+                Root.Opacity = value;
+                _backdrop?.SetAlpha((byte)Math.Round(value * 255));
+                if (t < 1) return;
+                StopFade();
+                done?.Invoke();
             };
-            if (done != null) anim.Completed += (_, _) => done();
-            Root.BeginAnimation(OpacityProperty, anim);
+            CompositionTarget.Rendering += _fadeFrame;
+        }
+
+        void StopFade()
+        {
+            if (_fadeFrame == null) return;
+            CompositionTarget.Rendering -= _fadeFrame;
+            _fadeFrame = null;
+        }
+
+        public void HideFence() => Hide();
+
+        public void ShowFence()
+        {
+            Show();
+            _mgr.LayoutWindow(this);
         }
 
         public static Color ResolveColor(string setting) => setting switch
@@ -520,11 +625,21 @@ namespace Desko.UI
             // A light, fairly opaque tint needs dark text (light theme, or a light custom colour).
             bool lightSurface = Theme.Luminance(c) > 0.55 && opacity >= 0.35;
             double shade = lightSurface ? 0.93 : 0.7;
-            Root.Background = Brush(Color.FromArgb(a, c.R, c.G, c.B));
-            TitleBar.Background = Brush(Color.FromArgb((byte)Math.Min(255, a + 45),
-                (byte)(c.R * shade), (byte)(c.G * shade), (byte)(c.B * shade)));
-
             var accent = Theme.Accent(lightSurface);
+            double s = DpiScale;
+            _look = new FenceBackdrop.Look(
+                Tint: Color.FromArgb(a, c.R, c.G, c.B),
+                TitleTint: Color.FromArgb((byte)Math.Min(255, a + 45), (byte)(c.R * shade), (byte)(c.G * shade), (byte)(c.B * shade)),
+                Border: lightSurface ? Color.FromArgb(0x22, 0, 0, 0) : Color.FromArgb(0x30, 0xFF, 0xFF, 0xFF),
+                Accent: accent,
+                TitlePx: (int)Math.Round(TitleHeightDip * s),
+                Radius: (int)Math.Round(8 * s),
+                Blur: _mgr.Config.Backdrop != "Clear",
+                Noise: _mgr.Config.Backdrop == "Acrylic",
+                Glow: false,
+                Spot: null);
+            UpdateBackdrop();
+            UpdateHitArea();
             Resources["FenceTextBrush"] = Brush(lightSurface ? Color.FromRgb(0x1B, 0x1B, 0x1B) : Colors.White);
             Resources["FenceSubtleTextBrush"] = Brush(lightSurface ? Color.FromArgb(0x99, 0, 0, 0) : Color.FromArgb(0xAA, 0xFF, 0xFF, 0xFF));
             Resources["FenceShadowOpacity"] = lightSurface ? 0.0 : 0.9;
@@ -536,8 +651,7 @@ namespace Desko.UI
             Resources["DropGlowBrush"] = Brush(Theme.WithAlpha(accent, 0x2A));
             Resources["MarqueeFillBrush"] = Brush(Theme.WithAlpha(accent, 0x33));
 
-            if (Handle != IntPtr.Zero) Native.SetBackdrop(Handle, _mgr.Config.Backdrop, darkFrame: !lightSurface);
-
+            Items.Visibility = IsDesktopFence ? Visibility.Collapsed : Visibility.Visible;
             TitleText.Text = DisplayTitle;
             BackButton.Visibility = _browsePath != null ? Visibility.Visible : Visibility.Collapsed;
             TitleBar.ToolTip = Config.IsPortal ? Config.FolderPath : null;
@@ -600,9 +714,22 @@ namespace Desko.UI
             if (tab == Config) return;
             Config = tab;
             _browsePath = null;
+            _scrollRow = 0;
             ClearSearch();
             _mgr.SetActiveTab(tab);
             Items.UnselectAll();
+            RestartWatcher();
+            ApplyAppearance();
+            Reload();
+            _mgr.LayoutAll(); // the other tabs' icons step aside
+        }
+
+        // Switched between a normal fence and a folder portal.
+        public void ModeChanged()
+        {
+            _browsePath = null;
+            _scrollRow = 0;
+            _iconOrder.Clear();
             RestartWatcher();
             ApplyAppearance();
             Reload();
@@ -620,9 +747,13 @@ namespace Desko.UI
             else _cursorHint?.Hide();
         }
 
-        // An overlay frame, not Root's own border: changing that would shrink the icon area and re-wrap rows.
-        public void SetMergeHighlight(bool on) =>
-            HighlightFrame.Visibility = on ? Visibility.Visible : Visibility.Collapsed;
+        // Drawn by the backdrop, under the icons: an accent frame and a light accent wash.
+        public void SetMergeHighlight(bool on)
+        {
+            if (_glow == on) return;
+            _glow = on;
+            UpdateBackdrop();
+        }
 
         void AskMerge(FenceWindow target)
         {
@@ -693,6 +824,13 @@ namespace Desko.UI
         public void Reload()
         {
             if (Handle == IntPtr.Zero) return;
+            if (IsDesktopFence)
+            {
+                if (_items.Count > 0) _items.Clear();
+                RefreshIconOrder();
+                _mgr.LayoutWindow(this);
+                return;
+            }
             string folder = ItemFolder;
             bool exists = Directory.Exists(folder);
             var fresh = new List<FileItem>();
@@ -700,21 +838,9 @@ namespace Desko.UI
             {
                 try
                 {
-                    if (Config.IsPortal)
-                    {
-                        foreach (var fsi in new DirectoryInfo(folder).EnumerateFileSystemInfos())
-                            if ((fsi.Attributes & (FileAttributes.Hidden | FileAttributes.System)) == 0)
-                                fresh.Add(MakeItem(fsi));
-                    }
-                    else
-                    {
-                        foreach (var name in Config.Members.Distinct(StringComparer.OrdinalIgnoreCase))
-                        {
-                            string path = Path.Combine(folder, name);
-                            FileSystemInfo fsi = Directory.Exists(path) ? new DirectoryInfo(path) : new FileInfo(path);
-                            if (fsi.Exists) fresh.Add(MakeItem(fsi));
-                        }
-                    }
+                    foreach (var fsi in new DirectoryInfo(folder).EnumerateFileSystemInfos())
+                        if ((fsi.Attributes & (FileAttributes.Hidden | FileAttributes.System)) == 0)
+                            fresh.Add(MakeItem(fsi));
                 }
                 catch (Exception ex) { Log.Error(ex); }
             }
@@ -747,6 +873,46 @@ namespace Desko.UI
 
         int IconSizeDip => Config.IconSize > 0 ? Config.IconSize : _mgr.DesktopIconSize;
 
+        // One icon cell in DIPs: the desktop's own grid, so a folder portal lines up with normal fences and with
+        // the desktop. A portal with its own icon size grows or shrinks the cell around the icon by as much.
+        public static readonly DependencyProperty CellWidthProperty =
+            DependencyProperty.Register(nameof(CellWidth), typeof(double), typeof(FenceWindow), new PropertyMetadata(76.0));
+        public static readonly DependencyProperty CellHeightProperty =
+            DependencyProperty.Register(nameof(CellHeight), typeof(double), typeof(FenceWindow), new PropertyMetadata(91.0));
+
+        public double CellWidth
+        {
+            get => (double)GetValue(CellWidthProperty);
+            set => SetValue(CellWidthProperty, value);
+        }
+
+        public double CellHeight
+        {
+            get => (double)GetValue(CellHeightProperty);
+            set => SetValue(CellHeightProperty, value);
+        }
+
+        void UpdateCellSize()
+        {
+            double s = DpiScale;
+            double extra = IconSizeDip - _mgr.DesktopIconSize;
+            CellWidth = Math.Round(IconGrid.Cell.X / s + extra);
+            CellHeight = Math.Round(IconGrid.Cell.Y / s + extra);
+            if (ItemsHost is VirtualizingWrapPanel panel) panel.CellSize = new Size(CellWidth, CellHeight);
+            // Picture and label exactly where Explorer draws them in a cell (see IconGrid.PictureDrop).
+            double top = (IconGrid.Offset.Y + IconGrid.PictureDrop) / s;
+            double gap = Math.Max(0, (IconGrid.LabelTop - IconGrid.PictureDrop) / s - _mgr.DesktopIconSize);
+            Resources["IconPictureMargin"] = new Thickness(0, top, 0, gap);
+            double font = IconGrid.LabelFontPx / s, line = Math.Ceiling(font * 1.33);
+            Resources["IconFont"] = new FontFamily(IconGrid.LabelFontFamily);
+            Resources["IconFontSize"] = font;
+            Resources["IconLineHeight"] = line;
+            Resources["IconLabelHeight"] = 2 * line;
+        }
+
+        // Labels as wide as their cell at most, as on the desktop.
+        double LabelWidth => CellWidth;
+
         // Hundreds of items (a portal onto a big folder): switch to a panel that only builds what is in view.
         // Hysteresis so a folder hovering around the limit doesn't flip back and forth.
         ItemsPanelTemplate? _wrapPanel;
@@ -767,9 +933,8 @@ namespace Desko.UI
             if (_virtualized)
                 Dispatcher.BeginInvoke(DispatcherPriority.Loaded, () =>
                 {
-                    // Same cell as the regular layout: item width/height plus padding, border and margin.
-                    if (ItemsHost is VirtualizingWrapPanel panel)
-                        panel.CellSize = new Size(IconSizeDip + 44, IconSizeDip + 46);
+                    // Same cells as the regular panel.
+                    if (ItemsHost is VirtualizingWrapPanel panel) panel.CellSize = new Size(CellWidth, CellHeight);
                 });
         }
 
@@ -810,7 +975,8 @@ namespace Desko.UI
         // Update the collection in place so selection and scroll position survive a refresh.
         void Sync(List<FileItem> target)
         {
-            double size = IconSizeDip;
+            UpdateCellSize();
+            double size = IconSizeDip, label = LabelWidth;
             int px = (int)Math.Round(size * DpiScale);
 
             // Drop vanished items first: the remaining ones then mostly line up already, which keeps the
@@ -826,6 +992,7 @@ namespace Desko.UI
                 if (j < 0)
                 {
                     t.IconSize = size;
+                    t.ItemWidth = label;
                     _items.Insert(i, t);
                     RequestIcon(t, px);
                     continue;
@@ -838,6 +1005,7 @@ namespace Desko.UI
                 item.IsFolder = t.IsFolder;
                 item.Modified = t.Modified;
                 item.IconSize = size;
+                item.ItemWidth = label;
                 if (needIcon) RequestIcon(item, px);
             }
             while (_items.Count > target.Count) _items.RemoveAt(_items.Count - 1);
@@ -873,7 +1041,6 @@ namespace Desko.UI
 
         void OpenItem(FileItem item)
         {
-            _mgr.EndPeek();
             try
             {
                 Process.Start(new ProcessStartInfo(item.Path)
@@ -1052,33 +1219,17 @@ namespace Desko.UI
 
         #endregion
 
-        #region Peek & reveal
-
-        bool _peekTop;
-
-        public void SetPeek(bool on)
-        {
-            _peekTop = on;
-            if (Handle == IntPtr.Zero) return;
-            const uint flags = Native.SWP_NOMOVE | Native.SWP_NOSIZE | Native.SWP_NOACTIVATE;
-            if (on)
-            {
-                // Windows owned by the desktop move as one group, so only one of them would come up:
-                // let go of the desktop for the duration of the peek.
-                Native.SetWindowLongPtr(Handle, Native.GWLP_HWNDPARENT, IntPtr.Zero);
-                Native.SetWindowPos(Handle, Native.HWND_TOPMOST, 0, 0, 0, 0, flags);
-            }
-            else
-            {
-                Native.SetWindowPos(Handle, Native.HWND_NOTOPMOST, 0, 0, 0, 0, flags);
-                AttachToDesktop(); // owned by the desktop again, back at the bottom
-            }
-        }
+        #region Reveal
 
         // Selects an item and flashes it (used by the global search's "show in fence").
         public void RevealItem(string path)
         {
             ClearSearch();
+            if (IsDesktopFence)
+            {
+                RevealIcon(FenceManager.MemberName(path));
+                return;
+            }
             if (Config.IsPortal)
             {
                 var parent = Path.GetDirectoryName(path.TrimEnd('\\'));
@@ -1098,6 +1249,30 @@ namespace Desko.UI
             item.IsDropTarget = true; // the drop-target highlight doubles as a brief "here it is" flash
             var flash = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(900) };
             flash.Tick += (_, _) => { flash.Stop(); item.IsDropTarget = false; };
+            flash.Start();
+        }
+
+        void RevealIcon(string name)
+        {
+            RefreshIconOrder();
+            if (Config.RolledUp && !_peeking)
+            {
+                // Unfold for a while; the usual hover check folds it again once the mouse is elsewhere.
+                _peeking = true;
+                ApplyBounds();
+                _peekTimer.Start();
+            }
+            int index = _iconOrder.FindIndex(n => string.Equals(n, name, StringComparison.OrdinalIgnoreCase));
+            if (index < 0) return;
+            var (cols, rows, _, _) = IconGridOf(ScreenRect);
+            int row = index / cols;
+            if (row < _scrollRow) _scrollRow = row;
+            else if (rows > 0 && row >= _scrollRow + rows) _scrollRow = row - rows + 1;
+            _mgr.LayoutWindow(this);
+            DesktopIcons.Select(name);
+            SetSpot(name); // a brief "here it is" glow under the icon
+            var flash = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(900) };
+            flash.Tick += (_, _) => { flash.Stop(); SetSpot(null); };
             flash.Start();
         }
 
@@ -1138,14 +1313,13 @@ namespace Desko.UI
             _browsePath == null ? Config.Title
                                 : Config.Title + "  ›  " + Path.GetRelativePath(Config.FolderPath, _browsePath).Replace("\\", "  ›  ");
 
-        void CopyToClipboard(bool cut) => _mgr.PutOnClipboard(SelectedItems().Select(i => i.Path).ToList(), cut);
+        void CopyToClipboard(bool cut) => FenceManager.PutOnClipboard(SelectedItems().Select(i => i.Path).ToList(), cut);
 
         void DeleteItems(List<FileItem> items, bool permanent)
         {
             var paths = items.Select(i => i.Path).ToList();
             if (paths.Count == 0) return;
-            // Un-hide first, so a file restored from the Recycle Bin is not left invisible.
-            _mgr.WithVisible(paths, () => FileOps.Delete(paths, Handle, permanent));
+            FileOps.Delete(paths, Handle, permanent);
             ScheduleReload();
         }
 
@@ -1163,16 +1337,16 @@ namespace Desko.UI
             }
             if (!Config.IsPortal)
             {
-                _mgr.ImportToDesktop(Config, files, copy: !move, _items.Count, Handle);
+                _mgr.ImportToDesktop(Config, files, copy: !move, null, Handle);
                 if (move) Clipboard.Clear();
             }
             else if (move)
             {
                 var list = files.Where(f => !InFolder(f)).ToArray();
-                if (_mgr.WithVisible(list, () => FileOps.Move(list, ItemFolder, Handle))) Clipboard.Clear();
+                if (FileOps.Move(list, ItemFolder, Handle)) Clipboard.Clear();
                 _mgr.ForgetMissing(list);
             }
-            else _mgr.WithVisible(files, () => FileOps.Copy(files, ItemFolder, Handle, renameOnCollision: files.Any(InFolder)));
+            else FileOps.Copy(files, ItemFolder, Handle, renameOnCollision: files.Any(InFolder));
             ScheduleReload();
         }
 
@@ -1193,8 +1367,22 @@ namespace Desko.UI
             }
             if (!Config.Locked)
             {
-                try { DragMove(); } catch (InvalidOperationException) { }
+                // The stand-in icons go up as soon as the title is pressed, and the move starts only once they are on
+                // screen and the real ones gone: a dragged fence never shows its icons twice. The move is anchored
+                // where the title was pressed, so the fence catches up with the mouse after the wait.
+                _movedOnce = false;
+                Native.GetCursorPos(out _pressCursor);
+                _pressRect = ScreenRect;
+                _pressAnchored = true;
+                BeginLift(moving: true);
+                try { if (WaitForLift(TitleBar)) DragMove(); } catch (InvalidOperationException) { }
+                finally { _pressAnchored = false; EndLift(); }
             }
+        }
+
+        void TitleBar_MouseEnter(object sender, MouseEventArgs e)
+        {
+            if (!Config.Locked && !_renaming) PrepareLift();
         }
 
         void Items_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
@@ -1423,7 +1611,7 @@ namespace Desko.UI
 
         void PeekTimer_Tick(object? sender, EventArgs e)
         {
-            if (_dragOver || _renaming || _menuOpen || _inSizeMove) return;
+            if (_dragOver || _dragMode || _renaming || _menuOpen || _inSizeMove) return;
             Native.GetCursorPos(out var pt);
             var r = ScreenRect;
             if (pt.X >= r.Left && pt.X < r.Right && pt.Y >= r.Top && pt.Y < r.Bottom) return;
@@ -1460,80 +1648,26 @@ namespace Desko.UI
 
         #region Drag & drop
 
+        // Dragging items out of a folder portal (normal fences hold real desktop icons: Explorer drags those).
         void StartDrag()
         {
             var paths = SelectedItems().Select(i => i.Path).ToArray();
             if (paths.Length == 0) return;
-            // Hovering another tab during the drag switches this window's Config, so remember the source tab.
-            var source = Config;
-
-            // Un-hide the items only once the cursor leaves all fences, so reordering or moving
-            // between fences does not flash icons on the desktop, while a copy made elsewhere is not hidden.
-            bool released = false;
-            var watch = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(40) };
-            watch.Tick += (_, _) =>
-            {
-                if (released || source.IsPortal || _mgr.IsCursorOverFence()) return;
-                released = true;
-                _mgr.BeginTransientVisible(paths);
-            };
-
-            // Dropping a fenced item on empty desktop space would ask Explorer to move a Desktop file into the
-            // Desktop ("destination folder is the same as the source"). Take that drop over: the item simply
-            // leaves the fence and its icon is placed where it was dropped.
-            bool droppedOnDesktop = false;
-            Native.POINT dropPoint = default;
-            Func<bool> interceptDrop = () =>
-            {
-                if (source.IsPortal) return false;
-                Native.GetCursorPos(out var pt);
-                if (!DesktopShell.IsDesktopAt(pt) || DesktopShell.IsIconAt(pt)) return false; // e.g. onto a folder icon
-                droppedOnDesktop = true;
-                dropPoint = pt;
-                return true;
-            };
-            QueryContinueDragEventHandler wpfQuery = (_, e) =>
-            {
-                if (e.EscapePressed || (e.KeyStates & DragDropKeyStates.LeftMouseButton) != 0) return;
-                if (interceptDrop()) { e.Action = DragAction.Cancel; e.Handled = true; }
-            };
-
             Mouse.Capture(null);
-            _dragSource = source;
-            watch.Start();
+            _dragSource = Config;
             try
             {
-                // The shell's own drag (icons under the cursor, "Move to Desktop" labels); WPF's as a fallback.
-                if (!ShellContextMenu.DoDragDrop(Handle, paths, interceptDrop))
+                // The shell's own drag (icons under the cursor, "Move to ..." labels); WPF's as a fallback.
+                if (!ShellContextMenu.DoDragDrop(Handle, paths, () => false))
                 {
                     var data = new DataObject();
                     data.SetData(DataFormats.FileDrop, paths);
-                    Items.QueryContinueDrag += wpfQuery;
                     DragDrop.DoDragDrop(Items, data, DragDropEffects.Copy | DragDropEffects.Move | DragDropEffects.Link);
                 }
             }
             catch (COMException ex) { Log.Error(ex); }
-            finally
-            {
-                Items.QueryContinueDrag -= wpfQuery;
-                watch.Stop();
-                _dragSource = null;
-            }
-
-            // Always: a drop onto a folder inside some fence marks the dragged items visible, whatever the source.
-            _mgr.EndTransientVisible(paths);
-            if (!source.IsPortal)
-            {
-                if (droppedOnDesktop)
-                {
-                    _mgr.Checkpoint("Đưa mục ra desktop");
-                    var onDesktop = paths.Where(p => File.Exists(p) || Directory.Exists(p)).ToList();
-                    _mgr.RemoveMembers(source, onDesktop.Select(p => Path.GetFileName(p)));
-                    DesktopIconPlacer.PlaceLater(onDesktop, dropPoint);
-                }
-                _mgr.ForgetMissing(paths);
-                _mgr.Reconcile();
-            }
+            finally { _dragSource = null; }
+            _mgr.ForgetMissing(paths);
             ScheduleReload();
         }
 
@@ -1558,7 +1692,8 @@ namespace Desko.UI
             string folder = ItemFolder;
             _dragFolderExists = Directory.Exists(folder);
             var files = _dragFiles;
-            _dragAllInFolder = files is { Length: > 0 } && files.All(InFolder);
+            // For a normal fence "in the folder" means already a desktop icon (user's or public Desktop).
+            _dragAllInFolder = files is { Length: > 0 } && files.All(f => IsDesktopFence ? FenceManager.IsDesktopItem(f) : InFolder(f));
             _dragSameVolume = files is { Length: > 0 } &&
                               string.Equals(Path.GetPathRoot(files[0]), Path.GetPathRoot(folder), StringComparison.OrdinalIgnoreCase);
         }
@@ -1573,9 +1708,8 @@ namespace Desko.UI
             var dropped = _dragFiles;
             if (dropped == null || dropped.Length == 0) return DragDropEffects.None;
             if (IsFromSelf) return DragDropEffects.Move;
-            // Desktop items (or items from another fence) only change membership.
-            if (!Config.IsPortal && _dragAllInFolder)
-                return DragDropEffects.Move;
+            // Desktop icons only change fence (or place).
+            if (IsDesktopFence && _dragAllInFolder) return DragDropEffects.Move;
 
             var allowed = e.AllowedEffects;
             if ((e.KeyStates & DragDropKeyStates.ControlKey) != 0 && allowed.HasFlag(DragDropEffects.Copy))
@@ -1626,8 +1760,10 @@ namespace Desko.UI
         void Window_DragOver(object sender, DragEventArgs e)
         {
             _leavePending = false;
-            // Hovering a tab while dragging opens it, so items can be dropped into any tab.
-            if (TabAt(InputHitTest(e.GetPosition(this)) as DependencyObject) is FenceConfig tab && tab != Config)
+            // Hovering a tab of a folder portal while dragging opens it. A normal fence keeps its tab: switching
+            // would move desktop icons while Explorer is still dragging (it stalls and scatters them), and a drag
+            // merely passing over the title would leave another tab open. Dropping on a tab still targets it.
+            if (!IsDesktopFence && TabAt(InputHitTest(e.GetPosition(this)) as DependencyObject) is FenceConfig tab && tab != Config)
                 SwitchTab(tab);
 
             SetItemTarget(ItemTargetAt(e), e);
@@ -1644,37 +1780,42 @@ namespace Desko.UI
             e.Handled = true;
         }
 
-        void SetDropGlow(bool on)
-        {
-            var visibility = on ? Visibility.Visible : Visibility.Collapsed;
-            if (DropGlow.Visibility == visibility) return;
-            DropGlow.Visibility = visibility;
-            SetMergeHighlight(on);
-        }
+        void SetDropGlow(bool on) => SetMergeHighlight(on);
 
         // Dropping onto a folder (zip, program...) inside the fence goes into that item, exactly as in
         // Explorer: its own shell drop handler does the work. The middle of an icon targets the item;
         // the gaps between icons keep meaning "into the fence / reorder".
         ShellContextMenu.IDropTarget? _itemTarget;
+        string? _itemTargetPath;
         FileItem? _itemTargetItem;
 
-        FileItem? ItemTargetAt(DragEventArgs e)
+        string? ItemTargetAt(DragEventArgs e)
         {
-            var lbi = FindAncestor<ListBoxItem>(Items.InputHitTest(e.GetPosition(Items)) as DependencyObject);
-            if (lbi?.DataContext is not FileItem item) return null;
-            if (Math.Abs(e.GetPosition(lbi).X - lbi.ActualWidth / 2) > lbi.ActualWidth * 0.3) return null;
-            if (_dragFiles?.Any(f => string.Equals(f.TrimEnd('\\'), item.Path, StringComparison.OrdinalIgnoreCase)) == true)
+            string? path;
+            if (IsDesktopFence)
+            {
+                path = MemberAt(CursorPoint()) is string name ? DesktopShell.MemberPath(name) : null;
+            }
+            else
+            {
+                var lbi = FindAncestor<ListBoxItem>(Items.InputHitTest(e.GetPosition(Items)) as DependencyObject);
+                if (lbi?.DataContext is not FileItem item) return null;
+                if (Math.Abs(e.GetPosition(lbi).X - lbi.ActualWidth / 2) > lbi.ActualWidth * 0.3) return null;
+                path = item.Path;
+            }
+            if (path == null) return null;
+            if (_dragFiles?.Any(f => string.Equals(f.TrimEnd('\\'), path, StringComparison.OrdinalIgnoreCase)) == true)
                 return null; // an item cannot be dropped onto itself
-            return item;
+            return path;
         }
 
-        void SetItemTarget(FileItem? item, DragEventArgs e)
+        void SetItemTarget(string? path, DragEventArgs e)
         {
-            if (item == _itemTargetItem) return;
+            if (string.Equals(path, _itemTargetPath, StringComparison.OrdinalIgnoreCase)) return;
             ClearItemTarget();
-            if (item == null || e.Data is not System.Runtime.InteropServices.ComTypes.IDataObject data) return;
-            _itemTargetItem = item; // remembered even when the item takes no drops, so we don't ask again
-            var target = ShellContextMenu.GetDropTarget(Handle, item.Path);
+            if (path == null || e.Data is not System.Runtime.InteropServices.ComTypes.IDataObject data) return;
+            _itemTargetPath = path; // remembered even when the item takes no drops, so we don't ask again
+            var target = ShellContextMenu.GetDropTarget(Handle, path);
             if (target == null) return;
             uint effect = (uint)e.AllowedEffects;
             if (target.DragEnter(data, (uint)e.KeyStates, CursorPoint(), ref effect) != 0)
@@ -1683,7 +1824,12 @@ namespace Desko.UI
                 return;
             }
             _itemTarget = target;
-            item.IsDropTarget = true;
+            if (IsDesktopFence) SetSpot(FenceManager.MemberName(path));
+            else
+            {
+                _itemTargetItem = _items.FirstOrDefault(i => string.Equals(i.Path, path, StringComparison.OrdinalIgnoreCase));
+                if (_itemTargetItem != null) _itemTargetItem.IsDropTarget = true;
+            }
         }
 
         void ClearItemTarget(bool dropped = false)
@@ -1696,6 +1842,8 @@ namespace Desko.UI
             }
             if (_itemTargetItem != null) _itemTargetItem.IsDropTarget = false;
             _itemTargetItem = null;
+            _itemTargetPath = null;
+            SetSpot(null);
         }
 
         static Native.POINT CursorPoint()
@@ -1736,14 +1884,12 @@ namespace Desko.UI
         {
             e.Handled = true;
             _leavePending = false;
+            var at = CursorPoint();
 
             if (_itemTarget != null && e.Data is System.Runtime.InteropServices.ComTypes.IDataObject data)
             {
-                // Items dragged out of a fence are hidden; un-hide them first so they don't arrive hidden.
-                // The fence they came from re-hides whatever is still on the Desktop once the drag ends.
-                if (_dragSource != null && _dragFiles != null) _mgr.BeginTransientVisible(_dragFiles);
                 uint dropEffect = (uint)e.AllowedEffects;
-                _itemTarget.Drop(data, (uint)e.KeyStates, CursorPoint(), ref dropEffect);
+                _itemTarget.Drop(data, (uint)e.KeyStates, at, ref dropEffect);
                 e.Effects = (DragDropEffects)dropEffect;
                 ClearItemTarget(dropped: true);
                 DropTargetHelper.Drop(e.Data, e.Effects);
@@ -1755,6 +1901,7 @@ namespace Desko.UI
             var effect = ComputeEffect(e);
             var files = _dragFiles;
             bool shellItems = _dragShellItemsOnly;
+            bool allOnDesktop = _dragAllInFolder;
             DropTargetHelper.Drop(e.Data, effect);
             EndDragOver();
             int index = DropIndex(e);
@@ -1763,10 +1910,10 @@ namespace Desko.UI
             {
                 // The data object is only valid during the drop: copy the item IDs out now.
                 var pidls = VirtualItems.ReadIdList(e.Data);
-                e.Effects = DragDropEffects.Link;
+                e.Effects = IsDesktopFence ? DragDropEffects.None : DragDropEffects.Link;
                 Dispatcher.BeginInvoke(() =>
                 {
-                    try { _mgr.AddShellItems(Config, pidls, index); }
+                    try { _mgr.AddShellItems(Config, pidls, at); }
                     finally { foreach (var p in pidls) Marshal.FreeCoTaskMem(p); }
                     ScheduleReload();
                 });
@@ -1790,25 +1937,30 @@ namespace Desko.UI
             bool copy = effect == DragDropEffects.Copy;
 
             // Run after the drop returns so the drag source (often Explorer) is not blocked.
-            if (!Config.IsPortal)
+            if (IsDesktopFence)
             {
-                _mgr.Checkpoint($"Đưa mục vào \"{Config.Title}\"");
-                Dispatcher.BeginInvoke(() => _mgr.ImportToDesktop(Config, files, copy, index, Handle));
+                // Dropped on the header of another tab: into that tab (it is opened afterwards).
+                var tab = TabAt(InputHitTest(e.GetPosition(this)) as DependencyObject) ?? Config;
+                var point = tab == Config ? at : (Native.POINT?)null;
+                _mgr.Checkpoint($"Đưa mục vào \"{tab.Title}\"");
+                if (allOnDesktop)
+                {
+                    var names = files.Select(FenceManager.MemberName).ToList();
+                    Dispatcher.BeginInvoke(() => { _mgr.AddMembers(tab, names, point); if (tab != Config) SwitchTab(tab); });
+                }
+                else Dispatcher.BeginInvoke(() => { _mgr.ImportToDesktop(tab, files, copy, point, Handle); if (tab != Config) SwitchTab(tab); });
                 return;
             }
 
             var list = files.Where(f => !InFolder(f)).ToArray();
             if (list.Length == 0) return;
-            var names = list.Select(f => Path.GetFileName(f.TrimEnd('\\'))).ToList();
+            var moved = list.Select(f => Path.GetFileName(f.TrimEnd('\\'))).ToList();
             string dest = ItemFolder;
             Dispatcher.BeginInvoke(() =>
             {
-                // Items coming from a normal fence are hidden; un-hide them so they are not hidden in the portal.
-                bool ok = _mgr.WithVisible(list, () => copy
-                    ? FileOps.Copy(list, dest, Handle)
-                    : FileOps.Move(list, dest, Handle));
+                bool ok = copy ? FileOps.Copy(list, dest, Handle) : FileOps.Move(list, dest, Handle);
                 if (!copy) _mgr.ForgetMissing(list);
-                if (ok && Config.SortMode == SortMode.Custom) InsertIntoOrder(names, index);
+                if (ok && Config.SortMode == SortMode.Custom) InsertIntoOrder(moved, index);
                 ScheduleReload();
             });
         }
@@ -1865,9 +2017,7 @@ namespace Desko.UI
             switch (cmd)
             {
                 case CmdMoveToDesktop:
-                    _mgr.Checkpoint("Đưa mục ra desktop");
-                    if (Config.IsPortal) FileOps.Move(sel.Select(i => i.Path), DesktopShell.DesktopPath, Handle);
-                    else _mgr.RemoveMembers(Config, sel.Select(i => i.FileName));
+                    FileOps.Move(sel.Select(i => i.Path), DesktopShell.DesktopPath, Handle);
                     break;
                 case ShellContextMenu.CmdRename:
                     RenameItem(sel[0]);
@@ -1929,14 +2079,18 @@ namespace Desko.UI
                     () => { Config.Opacity = v; Changed(); }));
             menu.Items.Add(opacity);
 
-            var icons = Sub("Kích thước icon");
-            icons.Items.Add(Check($"Giống desktop ({_mgr.DesktopIconSize}px)", Config.IconSize == 0,
-                () => { Config.IconSize = 0; Changed(); Reload(); }));
-            icons.Items.Add(new Separator());
-            foreach (var (name, size) in new[] { ("Nhỏ", 32), ("Vừa", 48), ("Lớn", 64), ("Rất lớn", 96) })
-                icons.Items.Add(Check(name, Config.IconSize == size,
-                    () => { Config.IconSize = size; Changed(); Reload(); }));
-            menu.Items.Add(icons);
+            // Normal fences show the desktop's own icons, sized with the desktop (View menu, Ctrl+wheel).
+            if (Config.IsPortal)
+            {
+                var icons = Sub("Kích thước icon");
+                icons.Items.Add(Check($"Giống desktop ({_mgr.DesktopIconSize}px)", Config.IconSize == 0,
+                    () => { Config.IconSize = 0; Changed(); Reload(); }));
+                icons.Items.Add(new Separator());
+                foreach (var (name, size) in new[] { ("Nhỏ", 32), ("Vừa", 48), ("Lớn", 64), ("Rất lớn", 96) })
+                    icons.Items.Add(Check(name, Config.IconSize == size,
+                        () => { Config.IconSize = size; Changed(); Reload(); }));
+                menu.Items.Add(icons);
+            }
 
             var sort = Sub("Sắp xếp theo");
             foreach (var (name, mode) in new[] { ("Thủ công (kéo thả)", SortMode.Custom), ("Tên", SortMode.Name),

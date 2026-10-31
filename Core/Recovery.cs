@@ -1,24 +1,47 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Threading;
 using Desko.Interop;
 using Desko.Models;
+using Desko.Shell;
 
 namespace Desko.Core
 {
-    // Guarantees fenced items are back on the desktop whenever the app is not running:
-    //  --watchdog <pid> : tiny companion process; un-hides everything the moment the app dies (crash, Task Manager...).
-    //  --restore        : registered to run at logon while items are hidden, for power loss / hard reset.
+    // Guarantees the desktop is whole whenever the app is not running: no icon left parked off screen,
+    // the icon view switched back on.
+    //  --watchdog <pid> : companion process (when DeskoGuard.exe is missing); restores the moment the app dies.
+    //  --restore        : run by DeskoGuard after a crash, and registered to run at logon while icons are
+    //                     parked and the app won't start by itself (power loss / hard reset).
     // Neither touches anything if a (new) app instance is already running.
     internal static class Recovery
     {
-        public const string MutexName = @"Local\Desko.SingleInstance";
-        public const string ExitEventName = @"Local\Desko.Exit";
-        public const string SettingsEventName = @"Local\Desko.ShowSettings";
-        public const string WelcomeEventName = @"Local\Desko.ShowWelcome";
+        // A suffix only tests set, to run an isolated copy next to the installed one.
+        static readonly string Instance = Environment.GetEnvironmentVariable("DESKO_INSTANCE") ?? "";
+        public static readonly string MutexName = $@"Local\Desko{Instance}.SingleInstance";
+        public static readonly string ExitEventName = $@"Local\Desko{Instance}.Exit";
+        public static readonly string SettingsEventName = $@"Local\Desko{Instance}.ShowSettings";
+        public static readonly string WelcomeEventName = $@"Local\Desko{Instance}.ShowWelcome";
+        // Held while a restore moves icons, so a Desko starting at that moment waits instead of fighting it.
+        static readonly string RestoringName = $@"Local\Desko{Instance}.Restoring";
 
-        // Asks the running app to quit normally (files shown again, settings saved) and waits for it.
+        // Called by the app before it touches the desktop: lets a restore that is still running finish first.
+        public static void WaitForRestore(TimeSpan timeout)
+        {
+            if (!Mutex.TryOpenExisting(RestoringName, out var busy)) return;
+            using (busy)
+            {
+                try
+                {
+                    if (busy.WaitOne(timeout)) busy.ReleaseMutex();
+                }
+                catch (AbandonedMutexException) { busy.ReleaseMutex(); }
+            }
+        }
+
+        // Asks the running app to quit normally (icons put back, settings saved) and waits for it.
         public static void RequestExit()
         {
             if (!EventWaitHandle.TryOpenExisting(ExitEventName, out var exitEvent)) return;
@@ -60,12 +83,12 @@ namespace Desko.Core
                 app.WaitForExit();
             }
             catch (ArgumentException) { } // already gone
-            if (!IsAppRunning()) ReleaseAll();
+            if (!IsAppRunning()) { Shell.DesktopIcons.EnsureRedraw(); ReleaseAll(); }
         }
 
         public static void RunRestore()
         {
-            if (!IsAppRunning()) ReleaseAll();
+            if (!IsAppRunning()) { Shell.DesktopIcons.EnsureRedraw(); ReleaseAll(); }
         }
 
         static bool IsAppRunning()
@@ -77,29 +100,81 @@ namespace Desko.Core
 
         static void ReleaseAll()
         {
+            using var busy = new Mutex(true, RestoringName, out _);
+            try { ReleaseAllCore(); }
+            finally { busy.ReleaseMutex(); }
+        }
+
+        static void ReleaseAllCore()
+        {
             var config = ConfigStore.Load();
-            ShowVirtualIcons(config);
-            if (config.HiddenByUs.Count > 0 || config.IconsHiddenByUs)
+            bool changed = false;
+
+            // Leftovers of version 2 (fenced files hidden, Recycle Bin & co. replaced by shortcuts).
+            if (config.VirtualIcons.Count > 0)
+            {
+                bool refresh = false;
+                foreach (var v in config.VirtualIcons) refresh |= VirtualItems.SetDesktopIconHidden(v.Clsid, false);
+                if (refresh) VirtualItems.RefreshDesktop();
+            }
+            if (config.HiddenByUs.Count > 0)
             {
                 foreach (var path in config.HiddenByUs) SetHidden(path, false);
                 config.HiddenByUs.Clear();
-                if (config.IconsHiddenByUs)
-                {
-                    DesktopShell.SetIconsVisible(true);
-                    config.IconsHiddenByUs = false;
-                }
-                ConfigStore.Save(config);
+                changed = true;
             }
-            AutoStart.SetRestoreEntry(false);
+
+            if (config.IconsHiddenByUs)
+            {
+                DesktopShell.SetIconsVisible(true);
+                config.IconsHiddenByUs = false;
+                changed = true;
+            }
+            if (config.IconsParked && UnparkIcons(config))
+            {
+                config.IconsParked = false;
+                changed = true;
+            }
+            // Never write over the settings of a Desko that started meanwhile: it owns them now.
+            if (IsAppRunning()) return;
+            if (changed) ConfigStore.Save(config);
+            if (!config.IconsParked) AutoStart.SetRestoreEntry(false);
         }
 
-        // Brings back the original Recycle Bin / This PC... icons. Their fence shortcuts stay hidden,
-        // so the desktop never shows both, and the next start moves them back into the fence.
-        public static void ShowVirtualIcons(AppConfig config)
+        // Icons parked off screen (rolled-up fences, other tabs, scrolled rows) come back to free spots.
+        // At logon Explorer may still be starting, so wait for its desktop a while.
+        static bool UnparkIcons(AppConfig config)
         {
-            bool changed = false;
-            foreach (var v in config.VirtualIcons) changed |= Shell.VirtualItems.SetDesktopIconHidden(v.Clsid, false);
-            if (changed) Shell.VirtualItems.RefreshDesktop();
+            List<DesktopIcons.Icon>? icons = null;
+            var waited = Stopwatch.StartNew();
+            while (waited.Elapsed < TimeSpan.FromSeconds(60))
+            {
+                if (DesktopShell.FindListView() != IntPtr.Zero && (icons = DesktopIcons.Enumerate()) != null) break;
+                DesktopIcons.Reset();
+                Thread.Sleep(1000);
+            }
+            if (icons == null) return false;
+            IconGrid.Refresh();
+            var visible = icons.Where(i => !DesktopIcons.IsParked(i.Position)).Select(i => IconGrid.CellRect(i.Position));
+            // A test copy (DESKO_INSTANCE) only ever brings back its own icons, never those of the real Desko.
+            var own = config.Fences.SelectMany(f => f.Members).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var parked = icons.Where(i => DesktopIcons.IsParked(i.Position) && (Instance.Length == 0 || own.Contains(i.Name))).ToList();
+            var home = Native.WorkAreaFromPoint(new Native.POINT(0, 0));
+            var spots = IconGrid.FreeCells(IconGrid.InCell(home.Left, home.Top), parked.Count, Array.Empty<Native.RECT>(), visible);
+            // Desko came back meanwhile (a restart right after a crash): it lays the icons out itself.
+            if (IsAppRunning()) return false;
+            DesktopIcons.Move(parked.Select((icon, i) => (icon.Name, spots[i])).ToList());
+            return true;
+        }
+
+        // Uninstall: "Auto arrange icons" / "Align icons to grid" back the way they were before Desko.
+        public static void RestoreDesktopArrange()
+        {
+            var config = ConfigStore.Load();
+            if (config.DesktopArrangeBefore is not int before) return;
+            DesktopIcons.SetArrange((before & 1) != 0, (before & 2) != 0);
+            config.DesktopArrangeBefore = null;
+            ConfigStore.Save(config);
         }
 
         public static void SetHidden(string path, bool hidden)

@@ -81,7 +81,18 @@ namespace Desko.Core
             }
         }
 
-        // A few ms of cross-process COM to Explorer – never call this from the hook callback itself.
-        public static bool IsIconAt(Native.POINT pt) => Shell.DesktopIconPlacer.IsIconAt(pt) ?? false;
+        static string? _publicDesktop;
+        public static string PublicDesktopPath => _publicDesktop ??= Environment.GetFolderPath(Environment.SpecialFolder.CommonDesktopDirectory);
+
+        // Fence members are named the way the Desktop folder names its items: a file name, or "::{CLSID}" for
+        // Recycle Bin, This PC... Returns something Explorer can open, or null when it no longer exists.
+        public static string? MemberPath(string name)
+        {
+            if (name.StartsWith("::", StringComparison.Ordinal)) return "shell:" + name;
+            string path = System.IO.Path.Combine(DesktopPath, name);
+            if (System.IO.File.Exists(path) || System.IO.Directory.Exists(path)) return path;
+            path = System.IO.Path.Combine(PublicDesktopPath, name);
+            return System.IO.File.Exists(path) || System.IO.Directory.Exists(path) ? path : null;
+        }
     }
 }

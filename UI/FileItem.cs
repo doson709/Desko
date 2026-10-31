@@ -35,16 +35,16 @@ namespace Desko.UI
         public double IconSize
         {
             get => _iconSize;
-            set
-            {
-                if (_iconSize == value) return;
-                _iconSize = value;
-                Changed();
-                Changed(nameof(ItemWidth));
-            }
+            set { if (_iconSize != value) { _iconSize = value; Changed(); } }
         }
 
-        public double ItemWidth => IconSize + 36;
+        // Width of the label: a little less than the grid cell the item sits in.
+        double _itemWidth = 70;
+        public double ItemWidth
+        {
+            get => _itemWidth;
+            set { if (_itemWidth != value) { _itemWidth = value; Changed(); } }
+        }
 
         // In-place rename: the label turns into a text box while this is true.
         bool _isRenaming;

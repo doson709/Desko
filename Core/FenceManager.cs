@@ -1,8 +1,9 @@
 using System;
 using System.Collections.Generic;
-using System.Collections.Specialized;
 using System.IO;
 using System.Linq;
+using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Interop;
 using System.Windows.Threading;
@@ -13,9 +14,11 @@ using Desko.UI;
 
 namespace Desko.Core
 {
-    // Normal fences keep their files on the Desktop and hide them from Explorer's desktop view
-    // with the Hidden attribute. Everything we hide is recorded in Config.HiddenByUs and undone on exit.
-    internal sealed class FenceManager
+    // Normal fences hold the real desktop icons: each member is placed on its fence's grid by moving the icon
+    // through Explorer's desktop view, and members that cannot show (rolled-up fence, other tabs, rows scrolled
+    // away) are parked far off screen. Files never move and are never hidden, so Explorer, file dialogs and
+    // everything else see the Desktop exactly as it is. Folder portals show another folder themselves.
+    internal sealed partial class FenceManager
     {
         const int MenuCreateFence = 1, MenuCreatePortal = 2, MenuCancel = 3;
 
@@ -23,22 +26,23 @@ namespace Desko.Core
         readonly DesktopHook _hook = new();
         readonly SelectionOverlay _overlay = new();
         readonly DispatcherTimer _saveTimer = new() { Interval = TimeSpan.FromMilliseconds(600) };
-        readonly DispatcherTimer _desktopTimer = new() { Interval = TimeSpan.FromMilliseconds(300) };
+        readonly DispatcherTimer _syncTimer = new() { Interval = TimeSpan.FromMilliseconds(350) };
         readonly DispatcherTimer _tidyTimer = new() { Interval = TimeSpan.FromSeconds(2) };
+        readonly DispatcherTimer _wallpaperTimer = new() { Interval = TimeSpan.FromSeconds(30) };
         readonly HashSet<string> _pendingTidy = new(StringComparer.OrdinalIgnoreCase);
 
-        // Items temporarily un-hidden: while being dragged out / deleted / moved, and while on the clipboard.
-        // Windows copies the Hidden attribute along with a file, so copies made elsewhere would vanish otherwise.
-        readonly HashSet<string> _opVisible = new(StringComparer.OrdinalIgnoreCase);
-        readonly HashSet<string> _clipboardVisible = new(StringComparer.OrdinalIgnoreCase);
-        uint _clipboardSeq;
+        // Where Desko last put each icon, and where every icon was at the last look (screen pixels).
+        readonly Dictionary<string, Native.POINT> _placed = new(StringComparer.OrdinalIgnoreCase);
+        readonly Dictionary<string, Native.POINT> _seen = new(StringComparer.OrdinalIgnoreCase);
+        bool _pendingUserMove;
 
         readonly object _rectLock = new();
         Native.RECT _latestRect;
         bool _rectQueued;
         FileSystemWatcher? _desktopWatcher;
-        HwndSource? _clipboardHost;
+        HwndSource? _messageHost;
         bool _shuttingDown;
+        int _nextZoneId = 1;
 
         public FenceManager(AppConfig config)
         {
@@ -50,11 +54,14 @@ namespace Desko.Core
                 SaveNow();
             };
             _displayTimer.Tick += (_, _) => { _displayTimer.Stop(); ApplyDisplayChange(); };
-            _desktopTimer.Tick += (_, _) =>
+            _syncTimer.Tick += (_, _) =>
             {
-                _desktopTimer.Stop();
-                Reconcile();
-                RefreshNormalFences();
+                _syncTimer.Stop();
+                bool user = _pendingUserMove;
+                _pendingUserMove = false;
+                _lastSyncWhy = _syncWhy.Count == 0 ? "other" : string.Join("+", _syncWhy);
+                _syncWhy.Clear();
+                SyncDesktop(user);
             };
             _tidyTimer.Tick += (_, _) =>
             {
@@ -63,12 +70,13 @@ namespace Desko.Core
                 _pendingTidy.Clear();
                 TidyDesktop(list, quiet: true);
             };
+            _wallpaperTimer.Tick += (_, _) => FenceBackdrop.CheckWallpaper();
         }
 
         public AppConfig Config { get; }
         public bool Hidden { get; private set; }
 
-        // Icon size of the desktop itself; fences with IconSize 0 use it so both look identical.
+        // Icon size of the desktop itself; folder portals with IconSize 0 use it so both look identical.
         public int DesktopIconSize { get; private set; } = 48;
         readonly DispatcherTimer _iconSizeTimer = new() { Interval = TimeSpan.FromSeconds(2) };
         int? _lastIconSizeSetting;
@@ -78,6 +86,9 @@ namespace Desko.Core
 
         public void Start()
         {
+            // Started right after a crash: let the restore that the watchdog launched finish first.
+            Recovery.WaitForRestore(TimeSpan.FromSeconds(10));
+
             // Icons were hidden by us when the app last died: give them back.
             if (Config.IconsHiddenByUs)
             {
@@ -92,18 +103,8 @@ namespace Desko.Core
                 foreach (var f in Config.Fences.Where(f => f.IconSize == 48)) f.IconSize = 0;
                 Config.FollowDesktopIconSizeMigrated = true;
             }
-            // The registry value is instant; asking Explorer itself (COM) can stall while it is still
-            // starting up after logon, so that more precise check runs once the fences are on screen.
-            _lastIconSizeSetting = DesktopIconPlacer.ReadDesktopIconSizeSetting();
+            _lastIconSizeSetting = DesktopIcons.ReadDesktopIconSizeSetting();
             DesktopIconSize = _lastIconSizeSetting ?? 48;
-            UI.BeginInvoke(DispatcherPriority.ApplicationIdle, () =>
-            {
-                if (DesktopIconPlacer.GetDesktopIconSize() is int exact && exact != DesktopIconSize)
-                {
-                    DesktopIconSize = exact;
-                    foreach (var w in _windows) w.Reload();
-                }
-            });
             _iconSizeTimer.Tick += (_, _) => CheckDesktopIconSize();
             _iconSizeTimer.Start();
 
@@ -115,9 +116,10 @@ namespace Desko.Core
             if (!DisplayLayouts.Restore(Config, _displaySignature)) DisplayLayouts.BringOffscreenHome(Config);
             DisplayLayouts.Remember(Config, _displaySignature);
 
-            Reconcile();
+            PrepareDesktop();
             foreach (var group in Config.Fences.GroupBy(GroupKey).ToList())
                 OpenWindow(group.FirstOrDefault(t => t.ActiveTab) ?? group.First(), rename: false);
+            UI.BeginInvoke(DispatcherPriority.Loaded, () => { LayoutAll(); SettleLayout(); });
 
             _hook.DesktopDoubleClicked += () => UI.BeginInvoke(() => { if (Config.DoubleClickToHide) ToggleHidden(); });
             _hook.MouseDownOn += hwnd => UI.BeginInvoke(() => OnMouseDownAnywhere(hwnd));
@@ -137,34 +139,67 @@ namespace Desko.Core
                 });
             };
             _hook.RightDragCompleted += r => UI.BeginInvoke(() => OnRightDragCompleted(r));
+            _hook.DragZoneChanged += zone => UI.BeginInvoke(() => SetDragZone(zone));
+            _hook.Released += (iconsMoved, from, to) => UI.BeginInvoke(() =>
+            {
+                WatchParked(iconsMoved ? "a drop" : "a release", iconsMoved ? from : null);
+                if (iconsMoved) OnIconsDragged(from, to);
+                else if (_movesDeferred) QueueSync(user: false, delayMs: 150, why: "deferred");
+            });
+            _hook.RightDragReleased += (from, to) => UI.BeginInvoke(() =>
+            {
+                WatchParked("a right-drop");
+                OnIconsDragged(from, to);
+                // ...and once more when the menu has most likely been answered.
+                var late = new DispatcherTimer { Interval = TimeSpan.FromSeconds(4) };
+                late.Tick += (_, _) => { late.Stop(); QueueSync(user: true); };
+                late.Start();
+            });
+            _hook.DesktopPressed += pt => UI.BeginInvoke(() => _lastDesktopPress = (DateTime.UtcNow, pt));
+            _hook.Wheel += (zone, delta) => UI.BeginInvoke(() =>
+                _windows.FirstOrDefault(w => w.ZoneId == zone)?.ScrollRows(delta > 0 ? -1 : 1));
 
             StartDesktopWatcher();
-            StartClipboardListener();
+            // A rebuilt icon list comes in a burst of events; parked icons it pulled on screen go back right after.
+            DesktopEvents.ItemsChanged += () =>
+            {
+                if (_shuttingDown || Hidden) return;
+                WatchParked("an explorer list change");
+                QueueSync(user: false, delayMs: 120, why: "explorer list");
+            };
+            DesktopEvents.SelectionChanged += OnSelectionChanged;
+            DesktopIcons.Watch.Reparked += (request, found, ms) => UI.BeginInvoke(() => OnReparked(request, found, ms));
+            DesktopIcons.Watch.Landed += (request, ms) => UI.BeginInvoke(() => OnDropLanded(request, ms));
+            DesktopEvents.Start();
+            StartMessageHost();
             ApplySettings();
             _hook.Start();
+            _wallpaperTimer.Start();
             SaveNow();
+            TestChannel.Start(this);
         }
 
         public void Shutdown()
         {
             _shuttingDown = true;
-            EndPeek();
             _iconSizeTimer.Stop();
-            if (_clipboardHost != null)
+            _wallpaperTimer.Stop();
+            if (_messageHost != null)
             {
-                Native.UnregisterHotKey(_clipboardHost.Handle, HotkeySearch);
-                Native.UnregisterHotKey(_clipboardHost.Handle, HotkeyPeek);
+                Native.UnregisterHotKey(_messageHost.Handle, HotkeySearch);
+                Native.UnregisterHotKey(_messageHost.Handle, HotkeyDesktop);
             }
             _hook.Dispose();
+            DesktopEvents.Stop();
             _desktopWatcher?.Dispose();
-            _clipboardHost?.Dispose();
+            _messageHost?.Dispose();
 
-            // Like the original: when the app is not running, fenced items are back on the desktop.
-            foreach (var path in Config.HiddenByUs) Recovery.SetHidden(path, false);
-            Config.HiddenByUs.Clear();
-            Recovery.ShowVirtualIcons(Config);
-            AutoStart.SetRestoreEntry(false);
-
+            // Like the original: without the app the icons simply stay where they are; parked ones come back.
+            if (ReleaseParked())
+            {
+                Config.IconsParked = false;
+                AutoStart.SetRestoreEntry(false);
+            }
             if (Config.IconsHiddenByUs)
             {
                 DesktopShell.SetIconsVisible(true);
@@ -175,6 +210,7 @@ namespace Desko.Core
                 w.ClosingByManager = true;
                 w.Close();
             }
+            DisplayLayouts.Remember(Config, _displaySignature); // a move just before exit is still in the save timer
             SaveNow();
         }
 
@@ -217,41 +253,54 @@ namespace Desko.Core
             _hook.RightDragEnabled = Config.RightDragToCreate;
             foreach (var w in _windows) w.ApplyAppearance();
             UpdateRestoreEntry();
+            if (_windows.Count > 0) QueueSync(user: false); // e.g. "Auto arrange" just switched on: pack now
         }
 
-        // If the app won't start at logon by itself, a logon "--restore" run brings hidden items back
+        // If the app won't start at logon by itself, a logon "--restore" run brings parked icons back
         // after a power loss (when even the watchdog could not run).
         // Skipped until AutoStart has been primed in the background; the app calls it again then.
         public void UpdateRestoreEntry()
         {
             if (AutoStart.Known is bool autostart)
-                AutoStart.SetRestoreEntry(Config.HiddenByUs.Count > 0 && !autostart);
+                AutoStart.SetRestoreEntry(Config.IconsParked && !autostart);
+        }
+
+        // Messages for the user (tray balloon); the tray may not exist yet when the first one comes up.
+        Action<string, string>? _notify;
+        readonly List<(string, string)> _pendingNotices = new();
+
+        public Action<string, string>? Notify
+        {
+            get => _notify;
+            set
+            {
+                _notify = value;
+                if (value == null) return;
+                foreach (var (title, text) in _pendingNotices) value(title, text);
+                _pendingNotices.Clear();
+            }
+        }
+
+        void Tell(string title, string text)
+        {
+            if (_notify != null) _notify(title, text);
+            else _pendingNotices.Add((title, text));
         }
 
         public IReadOnlyList<Native.RECT> GetOtherRects(FenceWindow except) =>
             _windows.Where(w => w != except && w.IsVisible && w.Handle != IntPtr.Zero).Select(w => w.ScreenRect).ToList();
 
-        public bool IsCursorOverFence()
-        {
-            Native.GetCursorPos(out var pt);
-            return _windows.Any(w =>
-            {
-                if (!w.IsVisible || w.Handle == IntPtr.Zero) return false;
-                var r = w.ScreenRect;
-                return pt.X >= r.Left && pt.X < r.Right && pt.Y >= r.Top && pt.Y < r.Bottom;
-            });
-        }
-
         // The user resized the desktop icons (View menu or Ctrl+wheel): follow along.
         void CheckDesktopIconSize()
         {
-            var setting = DesktopIconPlacer.ReadDesktopIconSizeSetting();
+            var setting = DesktopIcons.ReadDesktopIconSizeSetting();
             if (setting == _lastIconSizeSetting) return;
             _lastIconSizeSetting = setting;
-            int size = DesktopIconPlacer.GetDesktopIconSize() ?? DesktopIconSize;
-            if (size == DesktopIconSize) return;
+            int size = DesktopIcons.GetDesktopIconSize() ?? DesktopIconSize;
+            IconGrid.Refresh();
             DesktopIconSize = size;
             foreach (var w in _windows) w.Reload();
+            LayoutAll();
         }
 
         // Monitors plugged/unplugged or resolution changed. Every fence window reports it, and Windows
@@ -267,20 +316,610 @@ namespace Desko.Core
 
         void ApplyDisplayChange()
         {
+            FenceBackdrop.InvalidateWallpaper();
             string signature = DisplayLayouts.CurrentSignature();
-            if (signature == _displaySignature) return;
-            DisplayLayouts.Remember(Config, _displaySignature); // the fences still hold the old setup's positions
-            _displaySignature = signature;
-            if (!DisplayLayouts.Restore(Config, signature)) DisplayLayouts.BringOffscreenHome(Config);
-            foreach (var w in _windows) w.ApplyBounds();
-            DisplayLayouts.Remember(Config, signature);
-            SaveNow();
+            if (signature != _displaySignature)
+            {
+                DisplayLayouts.Remember(Config, _displaySignature); // the fences still hold the old setup's positions
+                _displaySignature = signature;
+                if (!DisplayLayouts.Restore(Config, signature)) DisplayLayouts.BringOffscreenHome(Config);
+                foreach (var w in _windows) w.ApplyBounds();
+                DisplayLayouts.Remember(Config, signature);
+                SaveNow();
+            }
+            // Windows may have shuffled the icons around for the new screen size.
+            _placed.Clear();
+            QueueSync(user: false);
         }
 
-        void RefreshNormalFences()
+        public void WallpaperChanged() => FenceBackdrop.InvalidateWallpaper();
+
+        // Explorer restarted: the desktop view, our backdrops (children of its desktop) and maybe the icon
+        // positions are gone. Rebuild everything once it is back.
+        readonly DispatcherTimer _explorerTimer = new() { Interval = TimeSpan.FromSeconds(2) };
+
+        public void ExplorerRestarted()
         {
-            foreach (var w in _windows) w.ScheduleReload();
+            _explorerTimer.Stop();
+            _explorerTimer.Tick -= OnExplorerBack;
+            _explorerTimer.Tick += OnExplorerBack;
+            _explorerTimer.Start();
         }
+
+        void OnExplorerBack(object? sender, EventArgs e)
+        {
+            if (DesktopShell.FindListView() == IntPtr.Zero) return; // not yet
+            _explorerTimer.Stop();
+            DesktopIcons.Reset();
+            DesktopEvents.Start(); // the new Explorer's list view
+            FenceBackdrop.RecreateAll();
+            foreach (var w in _windows) w.AttachToDesktop();
+            PrepareDesktop();
+            _placed.Clear();
+            LayoutAll();
+            SettleLayout();
+        }
+
+        #region Desktop icons
+
+        // Explorer must leave icons where they are put, and the icons of the old hide-the-files model come back.
+        void PrepareDesktop()
+        {
+            var was = DesktopIcons.EnsureFreeLayout();
+            if (was is { } flags && (flags.AutoArrange || flags.SnapToGrid))
+            {
+                // Remembered so uninstalling gives the desktop its own arrangement back.
+                Config.DesktopArrangeBefore ??= (flags.AutoArrange ? 1 : 0) | (flags.SnapToGrid ? 2 : 0);
+                Tell("Desko", "Đã tắt \"Auto arrange icons\" và \"Align icons to grid\" của desktop để đặt icon vào các fence.");
+            }
+            if (Config.LayoutVersion < 3) MigrateFromHiddenFiles();
+            IconGrid.Refresh();
+            Remember(DesktopIcons.Enumerate());
+        }
+
+        // Version 2 kept fenced files on the Desktop with the Hidden attribute and stood in for Recycle Bin & co.
+        // with hidden shortcuts. Undo both once: the icons themselves go into the fences now.
+        void MigrateFromHiddenFiles()
+        {
+            // The old configuration stays at hand, should anyone want to go back to version 2.
+            try
+            {
+                string backup = Path.Combine(ConfigStore.AppDataDir, "config.v2-backup.json");
+                if (File.Exists(ConfigStore.ConfigPath) && !File.Exists(backup)) File.Copy(ConfigStore.ConfigPath, backup);
+            }
+            catch (Exception ex) { Log.Error(ex); }
+
+            bool refresh = false;
+            foreach (var v in Config.VirtualIcons)
+            {
+                refresh |= VirtualItems.SetDesktopIconHidden(v.Clsid, false);
+                string member = "::" + v.Clsid;
+                foreach (var f in NormalFences)
+                {
+                    for (int i = 0; i < f.Members.Count; i++)
+                        if (string.Equals(f.Members[i], v.ShortcutName, StringComparison.OrdinalIgnoreCase)) f.Members[i] = member;
+                    for (int i = 0; i < f.Order.Count; i++)
+                        if (string.Equals(f.Order[i], v.ShortcutName, StringComparison.OrdinalIgnoreCase)) f.Order[i] = member;
+                }
+                try
+                {
+                    string shortcut = Path.Combine(Desktop, v.ShortcutName);
+                    if (File.Exists(shortcut)) File.Delete(shortcut);
+                }
+                catch (Exception ex) { Log.Error(ex); }
+            }
+            foreach (var path in Config.HiddenByUs) Recovery.SetHidden(path, false);
+            Config.VirtualIcons.Clear();
+            Config.HiddenByUs.Clear();
+            Config.LayoutVersion = 3;
+            SaveNow();
+            if (refresh) VirtualItems.RefreshDesktop();
+        }
+
+        // Icons that were just un-hidden or created show up in Explorer's view a moment later, and right after logon
+        // Explorer may still be filling the desktop: look again a few times, further and further apart.
+        void SettleLayout()
+        {
+            int round = 0;
+            var timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(500) };
+            timer.Tick += (_, _) =>
+            {
+                if (++round >= 5 || _shuttingDown) timer.Stop();
+                timer.Interval = TimeSpan.FromMilliseconds(500 << round); // 0.5, 1, 2, 4, 8 s
+                SyncDesktop(user: false);
+            };
+            timer.Start();
+        }
+
+        void Remember(List<DesktopIcons.Icon>? icons)
+        {
+            if (icons == null) return;
+            var now = DateTime.UtcNow;
+            foreach (var icon in icons)
+                if (!_seen.ContainsKey(icon.Name)) _firstSeen[icon.Name] = now;
+            _seen.Clear();
+            foreach (var icon in icons) _seen[icon.Name] = icon.Position;
+            foreach (var gone in _firstSeen.Keys.Where(n => !_seen.ContainsKey(n)).ToList()) _firstSeen.Remove(gone);
+        }
+
+        // When each icon first showed up. Explorer may create an item in one place and move it to where it was
+        // created (New > Folder) a moment later, so an icon counts as new for a few seconds.
+        readonly Dictionary<string, DateTime> _firstSeen = new(StringComparer.OrdinalIgnoreCase);
+
+        bool IsNew(string name) => !_firstSeen.TryGetValue(name, out var t) || DateTime.UtcNow - t < TimeSpan.FromSeconds(3);
+
+        public int NewZoneId() => _nextZoneId++;
+
+        // A test copy running next to the real Desko (see TestChannel): it must never touch parked icons that are
+        // not its own.
+        static readonly bool Isolated = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("DESKO_INSTANCE"));
+
+        // Places every fence's icons (and parks the ones that must not show).
+        public void LayoutAll()
+        {
+            if (_shuttingDown || Hidden) return; // hidden: the icons are switched off anyway; placed again on show
+            _movesDeferred = false;
+            var park = DesktopIcons.ParkPoint;
+            var moves = new List<(string, Native.POINT)>();
+            foreach (var w in _windows) w.CollectIconMoves(moves, park);
+            MoveIcons(moves);
+            if (Config.ArrangesLooseIcons) PackLoose();
+            UpdateZones();
+        }
+
+        public void LayoutWindow(FenceWindow w)
+        {
+            if (_shuttingDown || Hidden) return;
+            var moves = new List<(string, Native.POINT)>();
+            w.CollectIconMoves(moves, DesktopIcons.ParkPoint);
+            MoveIcons(moves);
+            UpdateZones();
+        }
+
+        // Set while icon moves wait for a drag to end (see DesktopHook.ForeignDragActive).
+        bool _movesDeferred;
+
+        // Explorer is running its drag loop (icons or files being dragged): moving icons now would fight with it
+        // (and stall the drag). The layout is redone once the button is released.
+        bool DeferMoves()
+        {
+            if (!_hook.ForeignDragActive) return false;
+            if (!_movesDeferred) Log.Trace("icon moves deferred: a drag is under way");
+            _movesDeferred = true;
+            return true;
+        }
+
+        void MoveIcons(List<(string Name, Native.POINT At)> moves)
+        {
+            if (DeferMoves()) return;
+            var changed = moves.Where(m => DesktopIcons.Has(m.Name) &&
+                                           (!_placed.TryGetValue(m.Name, out var p) || p.X != m.At.X || p.Y != m.At.Y))
+                               .ToList();
+            if (changed.Count == 0) return;
+            Log.Trace($"move {changed.Count} icons: {changed.Count(m => DesktopIcons.IsParked(m.At))} to park, {changed.Count(m => !DesktopIcons.IsParked(m.At))} into place");
+            // The watch works from a list of what is parked, which this changes: it starts over afterwards.
+            bool watching = Environment.TickCount64 < _watchUntil;
+            if (watching) DesktopIcons.Watch.Stop();
+            if (!Config.IconsParked && changed.Any(m => DesktopIcons.IsParked(m.At)))
+            {
+                // Recorded before parking anything, so a crash still brings them back.
+                Config.IconsParked = true;
+                SaveNow();
+                UpdateRestoreEntry();
+            }
+            DesktopIcons.Move(changed, repost: watching);
+            foreach (var (name, at) in changed)
+            {
+                _placed[name] = at;
+                _seen[name] = at;
+            }
+            // Parking keeps the selection (no selection event follows): an icon selected in a fence stays selected.
+            var parked = changed.Where(m => DesktopIcons.IsParked(m.At)).Select(m => m.Name).ToList();
+            if (parked.Count > 0 && DesktopIcons.DeselectIfSelected(parked) is int n and > 0) Log.Trace($"deselected {n} icons as they parked");
+            RefreshIconRects();
+            if (watching) WatchParked(_watchWhy);
+        }
+
+        void RefreshIconRects()
+        {
+            DesktopIcons.IconRects = _seen.Values.Where(p => !DesktopIcons.IsParked(p)).Select(IconGrid.CellRect).ToArray();
+        }
+
+        // The icon areas of the fences, for the mouse hook.
+        public void UpdateZones()
+        {
+            _hook.Zones = Hidden ? Array.Empty<DesktopHook.Zone>()
+                : _windows.Where(w => w.IsDesktopFence && w.ShowsIcons)
+                          .Select(w => new DesktopHook.Zone(w.BodyRect, w.ZoneId)).ToArray();
+        }
+
+        // A fence moved or changed size: its icons follow.
+        public void FenceBoundsChanged(FenceWindow w)
+        {
+            if (w.IsDesktopFence) LayoutWindow(w);
+            else UpdateZones();
+        }
+
+        // ...and once it is let go, the icons it now covers make room.
+        public void FenceMoveEnded() => QueueSync(user: false);
+
+        void QueueSync(bool user, int delayMs = 350, string? why = null)
+        {
+            _pendingUserMove |= user;
+            if (why != null && !_syncWhy.Contains(why)) _syncWhy.Add(why);
+            _syncTimer.Stop();
+            _syncTimer.Interval = TimeSpan.FromMilliseconds(delayMs);
+            _syncTimer.Start();
+        }
+
+        readonly List<string> _syncWhy = new(); // for the trace
+        string _lastSyncWhy = "";
+
+        // Explorer brings parked icons back on screen by itself (about 0.1 s after icons are dropped on the desktop,
+        // when it rebuilds its list...). DesktopIcons.Watch looks out for that on a thread of its own and sends them
+        // back at once; it also reports when a dropped icon has landed, so the look at the desktop that follows a
+        // drop (and the tidying up it does) happens right then rather than after a guessed delay.
+        string _watchWhy = "";
+        long _watchUntil;
+
+        void WatchParked(string why, Native.POINT? dropFrom = null)
+        {
+            if (_shuttingDown || Hidden) return;
+            var parked = new List<(string, byte[], Native.POINT, int)>();
+            foreach (var (name, at) in _placed)
+                if (DesktopIcons.IsParked(at) && DesktopIcons.PidlBytes(name) is { } bytes) parked.Add((name, bytes, at, DesktopIcons.IndexOf(name)));
+            (string, byte[], Native.POINT)? dropped = null;
+            if (dropFrom is { } from)
+            {
+                var hit = _seen.FirstOrDefault(s => !DesktopIcons.IsParked(s.Value) && Native.Contains(IconGrid.CellRect(s.Value), from));
+                if (hit.Key != null && DesktopIcons.PidlBytes(hit.Key) is { } bytes) dropped = (hit.Key, bytes, hit.Value);
+            }
+            if (parked.Count == 0 && dropped == null) return;
+            _watchWhy = why;
+            _watchUntil = Environment.TickCount64 + 600;
+            DesktopIcons.Watch.Start(new(parked, dropped, 600, why));
+        }
+
+        void OnReparked(DesktopIcons.Watch.Request request, List<(string Name, Native.POINT At)> found, long ms)
+        {
+            foreach (var (name, _) in found)
+                if (_placed.TryGetValue(name, out var at)) _seen[name] = at;
+            RefreshIconRects();
+            Log.Trace($"explorer brought {found.Count} parked icons on screen; sent back {ms} ms after {request.Why} " +
+                      $"(\"{found[0].Name}\" was at {found[0].At.X},{found[0].At.Y})");
+        }
+
+        void OnDropLanded(DesktopIcons.Watch.Request request, long ms)
+        {
+            Log.Trace($"dropped icon landed {ms} ms after {request.Why}");
+            if (_pendingUserMove) QueueSync(user: true, delayMs: 1, why: "landed");
+        }
+
+        // After a file change Explorer updates its view in steps (a rename re-adds the icon a moment later, wherever
+        // it likes): look once soon and once more when it has surely settled.
+        DispatcherTimer? _lateSync;
+
+        void QueueSyncTwice()
+        {
+            QueueSync(user: false);
+            _lateSync ??= new DispatcherTimer(TimeSpan.FromMilliseconds(1600), DispatcherPriority.Background, (_, _) =>
+            {
+                _lateSync!.Stop();
+                QueueSync(user: false);
+            }, UI);
+            _lateSync.Stop();
+            _lateSync.Start();
+        }
+
+        // A drag passing over the fences: the one under it takes the drop (see FenceWindow.SetDragMode).
+        // The drop reaches us just after the button is released, so the fences keep taking it a moment longer.
+        DispatcherTimer? _dragModeOff;
+
+        void SetDragZone(int zone)
+        {
+            _dragModeOff?.Stop();
+            if (zone >= 0)
+            {
+                foreach (var w in _windows) w.SetDragMode(w.ZoneId == zone);
+                return;
+            }
+            _dragModeOff ??= new DispatcherTimer(TimeSpan.FromMilliseconds(300), DispatcherPriority.Normal, (_, _) =>
+            {
+                _dragModeOff!.Stop();
+                foreach (var w in _windows) w.SetDragMode(false);
+            }, UI);
+            _dragModeOff.Start();
+        }
+
+        // The user dragged desktop icons: Explorer moved them to wherever they were dropped.
+        void OnIconsDragged(Native.POINT from, Native.POINT to)
+        {
+            NoteDrag(from, to);
+            QueueSync(user: true, delayMs: 150, why: "drop");
+            // Explorer can take a moment to report a drop of many icons.
+            var late = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(1200) };
+            late.Tick += (_, _) => { late.Stop(); QueueSync(user: true); };
+            late.Start();
+        }
+
+        // Explorer moves dropped icons by exactly how far the mouse travelled. Only icons that moved by a recent
+        // drag's distance count as moved by the user: anything else that shifted icons meanwhile (Explorer itself,
+        // a restore, another program) must never take them out of their fences.
+        readonly List<(DateTime When, Native.POINT Delta, Native.POINT Drop)> _recentDrags = new();
+
+        void NoteDrag(Native.POINT from, Native.POINT to)
+        {
+            _recentDrags.RemoveAll(d => DateTime.UtcNow - d.When > TimeSpan.FromSeconds(10));
+            _recentDrags.Add((DateTime.UtcNow, new Native.POINT(to.X - from.X, to.Y - from.Y), to));
+        }
+
+        // Moved by a recent drag's distance, or (the icon that was under the mouse) now right where it was dropped.
+        bool MovedByUser(Native.POINT before, Native.POINT now)
+        {
+            var cell = IconGrid.CellRect(now);
+            return _recentDrags.Any(d => DateTime.UtcNow - d.When < TimeSpan.FromSeconds(10) &&
+                ((Math.Abs(now.X - before.X - d.Delta.X) <= 12 && Math.Abs(now.Y - before.Y - d.Delta.Y) <= 12) ||
+                 Native.Contains(cell, d.Drop)));
+        }
+
+        // Parked icons must never be selected: a drag of the selection would carry them along (Explorer then moves
+        // and redraws them all, and the drag stalls), and Ctrl+A then Delete would delete icons nobody can see.
+        // Selection changes come in bursts (a click deselects many, Ctrl+A selects all), so this runs once after.
+        DispatcherTimer? _selectionTimer;
+
+        void OnSelectionChanged()
+        {
+            if (_shuttingDown) return;
+            _selectionTimer ??= new DispatcherTimer(TimeSpan.FromMilliseconds(30), DispatcherPriority.Normal, (_, _) =>
+            {
+                _selectionTimer!.Stop();
+                var parked = _placed.Where(p => DesktopIcons.IsParked(p.Value)).Select(p => p.Key).ToList();
+                int n = parked.Count == 0 ? 0 : DesktopIcons.DeselectIfSelected(parked);
+                if (n > 0) Log.Trace($"deselected {n} parked icons");
+            }, UI);
+            _selectionTimer.Stop();
+            _selectionTimer.Start();
+        }
+
+        // Where the user last pressed a mouse button on the desktop. New items created there (New > Folder,
+        // Paste) join a fence; items an app drops onto the desktop do not just because Windows put them under one.
+        (DateTime When, Native.POINT Where) _lastDesktopPress;
+
+        bool PressedRecentlyIn(FenceWindow w) =>
+            DateTime.UtcNow - _lastDesktopPress.When < TimeSpan.FromMinutes(2) && Native.Contains(w.BodyRect, _lastDesktopPress.Where);
+
+        FenceWindow? DesktopFenceAt(Native.POINT pt) =>
+            _windows.FirstOrDefault(w => w.IsDesktopFence && w.ShowsIcons && !Hidden && Native.Contains(w.BodyRect, pt));
+
+        // An icon (by position) that overlaps a fence's area, rolled up or not. A few pixels of touching are fine.
+        bool CoveredByFence(Native.POINT position)
+        {
+            var cell = IconGrid.CellRect(position);
+            var inner = new Native.RECT(cell.Left + 6, cell.Top + 4, cell.Right - 6, cell.Bottom - 4);
+            return _windows.Any(w => w.Handle != IntPtr.Zero && IconGrid.Overlaps(w.RestingRect, inner));
+        }
+
+        // Compares what is on the desktop with what the fences expect, after the user moved icons with the mouse
+        // (user = true) or after files appeared / changed. Explorer moved the icons itself in those cases:
+        //  - a fenced icon dropped outside every fence leaves its fence;
+        //  - an icon dropped on a fence's icon area joins that fence, and so does a new item created where the
+        //    user just clicked in a fence (New > Folder, Paste);
+        //  - any other icon under a fence (a fence moved over it, a download Windows put there) makes room;
+        //  - anything else of ours that is not where we put it is put back.
+        public void SyncDesktop(bool user)
+        {
+            if (_shuttingDown || Hidden || DeferMoves()) return; // after a drag: looked at once it is dropped
+            var flags = DesktopIcons.EnsureFreeLayout();
+            if (flags is { } f && (f.AutoArrange || f.SnapToGrid))
+            {
+                Tell("Desko", "Desko cần tắt \"Auto arrange icons\" và \"Align icons to grid\" để giữ icon trong fence.");
+                _placed.Clear();
+            }
+            var icons = DesktopIcons.Enumerate();
+            if (icons == null) return;
+            IconGrid.Refresh(); // the desktop icon size may have changed
+            // Members that appeared or went away since the last look change every fence's slots.
+            foreach (var w in _windows) w.RefreshIconOrder();
+
+            var owner = new Dictionary<string, FenceConfig>(StringComparer.OrdinalIgnoreCase);
+            foreach (var fence in NormalFences)
+                foreach (var name in fence.Members) owner.TryAdd(name, fence);
+
+            // Diagnostics: parked members Explorer moved (dragged along with a selection) or brought back on screen.
+            int unparkedByOthers = icons.Count(i => owner.ContainsKey(i.Name) && !DesktopIcons.IsParked(i.Position) &&
+                                                   _placed.TryGetValue(i.Name, out var w) && DesktopIcons.IsParked(w));
+            int displaced = icons.Count(i => owner.ContainsKey(i.Name) && DesktopIcons.IsParked(i.Position) &&
+                                            _placed.TryGetValue(i.Name, out var w) && DesktopIcons.IsParked(w) && Far(w, i.Position));
+
+            bool packing = Config.ArrangesLooseIcons;
+            var mainWork = Native.WorkAreaFromPoint(new Native.POINT(0, 0));
+            var joins = new Dictionary<FenceWindow, List<(string Name, Native.POINT Center)>>();
+            var leaves = new List<(FenceConfig Fence, string Name, Native.POINT At)>();
+            var loose = new List<(string Name, Native.POINT At)>();
+
+            foreach (var icon in icons)
+            {
+                var pos = icon.Position;
+                bool known = _seen.TryGetValue(icon.Name, out var before);
+                bool moved = !known || Far(before, pos);
+                bool parked = DesktopIcons.IsParked(pos);
+                var center = IconGrid.CellCenter(pos);
+                var target = parked ? null : DesktopFenceAt(center);
+                // Dragged by the user (it moved exactly as far as a drag just did), not shifted by something else.
+                bool dragged = user && known && moved && !parked && MovedByUser(before, pos);
+
+                if (owner.TryGetValue(icon.Name, out var fence))
+                {
+                    if (_placed.TryGetValue(icon.Name, out var want) && !Far(want, pos)) continue;
+                    if (dragged)
+                    {
+                        if (target != null) Join(joins, target, icon.Name, center);
+                        else leaves.Add((fence, icon.Name, pos));
+                    }
+                    else _placed.Remove(icon.Name); // put back below
+                }
+                else if (parked) { if (!Isolated) loose.Add((icon.Name, pos)); } // stranded by a crash
+                else if (target != null && (dragged || (IsNew(icon.Name) && PressedRecentlyIn(target))))
+                    Join(joins, target, icon.Name, center);
+                else if (packing && Native.Contains(mainWork, center)) continue; // packed below, all together
+                else if (CoveredByFence(pos)) loose.Add((icon.Name, pos));
+                else if (dragged && Config.AlignLooseIcons && !IconGrid.IsAligned(pos)) loose.Add((icon.Name, pos));
+            }
+            Remember(icons);
+            Log.Trace($"sync ({_lastSyncWhy}) user={user}: {icons.Count} icons, {(user ? DesktopIcons.SelectedCount() : -1)} selected, " +
+                      $"{displaced} parked moved off their spot, {unparkedByOthers} parked members found on screen, " +
+                      $"{leaves.Count} leave, {joins.Sum(j => j.Value.Count)} join, {loose.Count} to free cells");
+            _lastSyncWhy = "other"; // direct calls (not through the timer)
+
+            if (leaves.Count > 0)
+            {
+                Checkpoint("Đưa mục ra desktop");
+                foreach (var group in leaves.GroupBy(l => l.Fence))
+                {
+                    var names = group.Select(l => l.Name).ToHashSet(StringComparer.OrdinalIgnoreCase);
+                    group.Key.Members.RemoveAll(names.Contains);
+                    group.Key.Order.RemoveAll(names.Contains);
+                    foreach (var n in names) _placed.Remove(n);
+                }
+                if (Config.AlignLooseIcons && !packing) loose.AddRange(leaves.Select(l => (l.Name, l.At)));
+                SaveSoon();
+            }
+            if (joins.Count > 0)
+            {
+                Checkpoint("Đưa mục vào fence");
+                foreach (var (window, list) in joins)
+                {
+                    var ordered = list.OrderBy(j => j.Center.Y / Math.Max(1, IconGrid.Cell.Y)).ThenBy(j => j.Center.X).ToList();
+                    AddMembers(window.Config, ordered.Select(j => j.Name).ToList(), ordered[0].Center, layout: false);
+                }
+            }
+            if (leaves.Count > 0 || joins.Count > 0)
+                foreach (var w in _windows) w.RefreshIconOrder();
+            if (loose.Count > 0) PlaceLoose(loose);
+            LayoutAll(); // only what is not where it belongs actually moves
+        }
+
+        static void Join(Dictionary<FenceWindow, List<(string, Native.POINT)>> joins, FenceWindow w, string name, Native.POINT center)
+        {
+            if (!joins.TryGetValue(w, out var list)) joins[w] = list = new List<(string, Native.POINT)>();
+            list.Add((name, center));
+        }
+
+        static bool Far(Native.POINT a, Native.POINT b) => Math.Abs(a.X - b.X) > 2 || Math.Abs(a.Y - b.Y) > 2;
+
+        // Loose icons go to the nearest free grid cell outside every fence. Parked ones have no place of their own:
+        // they go near `parkedNear` (the fence they come from), or else to the top-left of the main screen.
+        void PlaceLoose(List<(string Name, Native.POINT At)> icons, Native.POINT? parkedNear = null)
+        {
+            var moving = icons.Select(i => i.Name).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var blocked = _windows.Where(w => w.Handle != IntPtr.Zero).Select(w => w.RestingRect).ToList();
+            var others = _seen.Where(s => !moving.Contains(s.Key) && !DesktopIcons.IsParked(s.Value))
+                              .Select(s => IconGrid.CellRect(s.Value)).ToList();
+            var home = Native.WorkAreaFromPoint(new Native.POINT(0, 0));
+            var moves = new List<(string, Native.POINT)>();
+            foreach (var (name, at) in icons)
+            {
+                var near = !DesktopIcons.IsParked(at) ? at : parkedNear ?? IconGrid.InCell(home.Left, home.Top);
+                var spot = IconGrid.FreeCells(near, 1, blocked, others)[0];
+                others.Add(IconGrid.CellRect(spot));
+                moves.Add((name, spot));
+                _placed.Remove(name);
+            }
+            if (moves.Count == 0) return;
+            Log.Trace($"place {moves.Count} loose icons, e.g. {icons[0].At.X},{icons[0].At.Y} -> {moves[0].Item2.X},{moves[0].Item2.Y}");
+            DesktopIcons.Move(moves);
+            foreach (var (name, at) in moves) _seen[name] = at;
+        }
+
+        // Tray command: packs the icons outside the fences once, whatever the setting.
+        public void ArrangeLooseIcons()
+        {
+            if (Hidden) return;
+            var icons = DesktopIcons.Enumerate();
+            if (icons == null) return;
+            Remember(icons);
+            PackLoose();
+        }
+
+        // Keeps the icons outside the fences on the main screen packed into columns from its top-left corner, in
+        // their current order and flowing around the fences: Windows' "Auto arrange icons", which has to stay off
+        // (it would pull the fenced icons into its columns too). Dropping an icon between others puts it there in
+        // the order, as with Windows. Works from what was last seen; only icons not already in place move.
+        void PackLoose()
+        {
+            if (DeferMoves()) return;
+            var members = NormalFences.SelectMany(f => f.Members).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var work = Native.WorkAreaFromPoint(new Native.POINT(0, 0));
+            var cell = IconGrid.Cell;
+            var loose = _seen.Where(s => !members.Contains(s.Key) && !DesktopIcons.IsParked(s.Value) &&
+                                         Native.Contains(work, IconGrid.CellCenter(s.Value)))
+                             .OrderBy(s => (IconGrid.CellCenter(s.Value).X - work.Left) / cell.X)
+                             .ThenBy(s => s.Value.Y)
+                             .ToList();
+            var fences = _windows.Where(w => w.Handle != IntPtr.Zero).Select(w => w.RestingRect).ToList();
+            var moves = new List<(string, Native.POINT)>();
+            int next = 0;
+            for (int x = work.Left; x + cell.X <= work.Right && next < loose.Count; x += cell.X)
+                for (int y = work.Top; y + cell.Y <= work.Bottom && next < loose.Count; y += cell.Y)
+                {
+                    var r = new Native.RECT(x, y, x + cell.X, y + cell.Y);
+                    if (fences.Any(f => IconGrid.Overlaps(f, r))) continue;
+                    var (name, at) = loose[next++];
+                    var spot = IconGrid.InCell(x, y);
+                    if (Far(at, spot)) moves.Add((name, spot));
+                }
+            // Anything that does not fit stays where it is.
+            if (moves.Count == 0) return;
+            Log.Trace($"pack: {moves.Count} loose icons move");
+            DesktopIcons.Move(moves);
+            foreach (var (name, at) in moves) _seen[name] = at;
+            RefreshIconRects();
+        }
+
+        // Icons that leave the fences for good (fence deleted, turned into a portal, tab removed). Parked ones
+        // come back on screen next to where the fence is (`from`); `all` also moves the visible ones out of the way.
+        void ReleaseIcons(IEnumerable<string> names, bool all, FenceConfig? from = null)
+        {
+            var list = new List<(string, Native.POINT)>();
+            foreach (var name in names)
+            {
+                if (!_seen.TryGetValue(name, out var at)) continue;
+                _placed.Remove(name);
+                if (all || DesktopIcons.IsParked(at)) list.Add((name, at));
+            }
+            if (list.Count > 0) PlaceLoose(list, from is null ? null : IconGrid.InCell(from.X + from.Width, from.Y));
+        }
+
+        // At exit: every parked icon back on screen, near its fence. Returns false if Explorer could not be reached.
+        bool ReleaseParked()
+        {
+            var icons = DesktopIcons.Enumerate();
+            if (icons == null) return !Config.IconsParked;
+            var visible = icons.Where(i => !DesktopIcons.IsParked(i.Position)).Select(i => IconGrid.CellRect(i.Position)).ToList();
+            var owner = new Dictionary<string, FenceConfig>(StringComparer.OrdinalIgnoreCase);
+            foreach (var fence in NormalFences)
+                foreach (var name in fence.Members) owner.TryAdd(name, fence);
+
+            var home = Native.WorkAreaFromPoint(new Native.POINT(0, 0));
+            var moves = new List<(string, Native.POINT)>();
+            foreach (var group in icons.Where(i => DesktopIcons.IsParked(i.Position) && (!Isolated || owner.ContainsKey(i.Name)))
+                                       .GroupBy(i => owner.TryGetValue(i.Name, out var f) ? f : null))
+            {
+                var near = group.Key is FenceConfig f ? IconGrid.InCell(f.X + f.Width, f.Y) : IconGrid.InCell(home.Left, home.Top);
+                var spots = IconGrid.FreeCells(near, group.Count(), Array.Empty<Native.RECT>(), visible);
+                int k = 0;
+                foreach (var icon in group)
+                {
+                    var spot = spots[k++];
+                    visible.Add(IconGrid.CellRect(spot));
+                    moves.Add((icon.Name, spot));
+                }
+            }
+            DesktopIcons.Move(moves);
+            return true;
+        }
+
+        #endregion
 
         #region Tabs
 
@@ -296,7 +935,7 @@ namespace Desko.Core
 
         public IReadOnlyList<FenceWindow> OtherWindows(FenceWindow except) => _windows.Where(w => w != except).ToList();
 
-        // A click outside a fence (another fence, the desktop, any other app) drops that fence's selection.
+        // A click outside a folder portal (another fence, the desktop, any other app) drops its selection.
         // Clicks on our own menus and dialogs don't: they usually act on that very selection.
         void OnMouseDownAnywhere(IntPtr hwnd)
         {
@@ -321,8 +960,7 @@ namespace Desko.Core
         public FenceWindow? WindowAt(Native.POINT pt, FenceWindow except) => _windows.FirstOrDefault(w =>
         {
             if (w == except || !w.IsVisible || w.Handle == IntPtr.Zero) return false;
-            var r = w.ScreenRect;
-            return pt.X >= r.Left && pt.X < r.Right && pt.Y >= r.Top && pt.Y < r.Bottom;
+            return Native.Contains(w.ScreenRect, pt);
         });
 
         static void CopyLook(FenceConfig from, FenceConfig to)
@@ -372,6 +1010,7 @@ namespace Desko.Core
             tab.X += (int)(32 * s);
             tab.Y += (int)(32 * s);
             OpenWindow(tab, rename: false);
+            LayoutAll();
             SaveSoon();
         }
 
@@ -395,176 +1034,80 @@ namespace Desko.Core
             source.Close();
             target.SwitchTab(moving[0]);
             target.RebuildTabs();
+            LayoutAll();
             SaveSoon();
         }
 
         #endregion
 
-        #region Hidden attribute bookkeeping
+        #region Shell items & clipboard
 
-        // Brings the Hidden attribute of every desktop item in line with fence membership.
-        public void Reconcile()
-        {
-            if (_shuttingDown) return;
-            ReconcileVirtualIcons();
-            var virtualShortcuts = Config.VirtualIcons.Select(v => v.ShortcutName).ToHashSet(StringComparer.OrdinalIgnoreCase);
-            var wanted = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var f in NormalFences)
-                foreach (var name in f.Members)
-                {
-                    if (virtualShortcuts.Contains(name)) continue; // always hidden, see ReconcileVirtualIcons
-                    var path = Path.Combine(Desktop, name);
-                    if (!_opVisible.Contains(path) && !_clipboardVisible.Contains(path) && Exists(path)) wanted.Add(path);
-                }
-
-            var tracked = new HashSet<string>(Config.HiddenByUs, StringComparer.OrdinalIgnoreCase);
-            var toHide = wanted.Where(p => !tracked.Contains(p)).ToList();
-            var toRelease = tracked.Where(p => !wanted.Contains(p)).ToList();
-
-            // Record before hiding, so a crash right after can still undo it.
-            if (toHide.Count > 0)
-            {
-                Config.HiddenByUs = tracked.Concat(toHide).ToList();
-                SaveNow();
-                UpdateRestoreEntry();
-            }
-            foreach (var p in wanted) Recovery.SetHidden(p, true);
-
-            if (toRelease.Count > 0)
-            {
-                foreach (var p in toRelease) Recovery.SetHidden(p, false);
-                Config.HiddenByUs = Config.HiddenByUs.Where(p => wanted.Contains(p)).ToList();
-                SaveNow();
-                UpdateRestoreEntry();
-            }
-        }
-
-        // A fenced Recycle Bin / This PC... is a shortcut on the Desktop (kept hidden) plus the original icon
-        // switched off. Once the shortcut leaves every fence (dragged out, deleted), the original comes back.
-        void ReconcileVirtualIcons()
-        {
-            bool refresh = false, changed = false;
-            foreach (var v in Config.VirtualIcons.ToList())
-            {
-                string path = Path.Combine(Desktop, v.ShortcutName);
-                bool fenced = Exists(path) &&
-                              NormalFences.Any(f => f.Members.Contains(v.ShortcutName, StringComparer.OrdinalIgnoreCase));
-                if (fenced)
-                {
-                    Recovery.SetHidden(path, true);
-                    refresh |= VirtualItems.SetDesktopIconHidden(v.Clsid, true);
-                    continue;
-                }
-                refresh |= VirtualItems.SetDesktopIconHidden(v.Clsid, false);
-                try { if (File.Exists(path)) File.Delete(path); }
-                catch (Exception ex) { Log.Error(ex); }
-                foreach (var f in NormalFences)
-                {
-                    f.Members.RemoveAll(n => string.Equals(n, v.ShortcutName, StringComparison.OrdinalIgnoreCase));
-                    f.Order.RemoveAll(n => string.Equals(n, v.ShortcutName, StringComparison.OrdinalIgnoreCase));
-                }
-                Config.VirtualIcons.Remove(v);
-                changed = true;
-            }
-            if (refresh) VirtualItems.RefreshDesktop();
-            if (changed) SaveNow();
-        }
-
-        // Dropped items that are not files: store a shortcut to each one in the fence.
-        public void AddShellItems(FenceConfig fence, IReadOnlyList<IntPtr> pidls, int index)
+        // Dropped items that are not files. Desktop icons (Recycle Bin, This PC...) simply join the fence;
+        // anything else (a Start-menu app...) gets a shortcut, on the Desktop or in the portal's folder.
+        public void AddShellItems(FenceConfig fence, IReadOnlyList<IntPtr> pidls, Native.POINT? at)
         {
             string folder = fence.IsPortal ? fence.FolderPath : Desktop;
             var names = new List<string>();
             foreach (var pidl in pidls)
             {
                 string? clsid = fence.IsPortal ? null : VirtualItems.DesktopIconClsid(pidl);
-                if (clsid != null && Config.VirtualIcons.Any(v => string.Equals(v.Clsid, clsid, StringComparison.OrdinalIgnoreCase)))
+                if (clsid != null)
+                {
+                    names.Add("::" + clsid);
                     continue;
+                }
                 string display = VirtualItems.GetName(pidl, parsing: false) ?? "Shortcut";
                 string safe = new string(display.Select(c => Path.GetInvalidFileNameChars().Contains(c) ? '_' : c).ToArray()).Trim();
                 string path = UniquePath(folder, (safe.Length > 0 ? safe : "Shortcut") + ".lnk");
                 if (!VirtualItems.CreateShortcut(pidl, path)) continue;
-                string name = Path.GetFileName(path);
-                names.Add(name);
-                if (clsid != null) Config.VirtualIcons.Add(new VirtualIcon { Clsid = clsid, ShortcutName = name });
+                names.Add(Path.GetFileName(path));
             }
             if (names.Count == 0) return;
             if (fence.IsPortal) SaveSoon();
-            else AddMembers(fence, names, index);
-        }
-
-        public bool WithVisible(IEnumerable<string> paths, Func<bool> action)
-        {
-            var list = paths.ToList();
-            _opVisible.UnionWith(list);
-            Reconcile();
-            try { return action(); }
-            finally
+            else
             {
-                _opVisible.ExceptWith(list);
-                Reconcile();
-                RefreshNormalFences();
+                AddMembers(fence, names, at);
+                QueueSync(user: false); // new shortcuts reach the desktop view a moment later
             }
         }
 
-        public void BeginTransientVisible(IEnumerable<string> paths)
-        {
-            _opVisible.UnionWith(paths);
-            Reconcile();
-        }
-
-        public void EndTransientVisible(IEnumerable<string> paths) => _opVisible.ExceptWith(paths);
-
-        public void PutOnClipboard(IReadOnlyList<string> paths, bool cut)
+        public static void PutOnClipboard(IReadOnlyList<string> paths, bool cut)
         {
             if (paths.Count == 0) return;
-            _clipboardVisible.Clear();
-            _clipboardVisible.UnionWith(paths);
-            Reconcile();
-
-            var list = new StringCollection();
+            var list = new System.Collections.Specialized.StringCollection();
             list.AddRange(paths.ToArray());
             var data = new DataObject();
             data.SetFileDropList(list);
             data.SetData("Preferred DropEffect", new MemoryStream(BitConverter.GetBytes(cut ? 2 : 5)));
             try { Clipboard.SetDataObject(data, true); }
             catch (Exception ex) { Log.Error(ex); }
-            _clipboardSeq = Native.GetClipboardSequenceNumber();
         }
 
-        void StartClipboardListener()
+        void StartMessageHost()
         {
             try
             {
-                _clipboardHost = new HwndSource(new HwndSourceParameters("DeskoClipboard")
+                _messageHost = new HwndSource(new HwndSourceParameters("DeskoMessages")
                 {
                     Width = 0,
                     Height = 0,
                     WindowStyle = 0,
                     ParentWindow = new IntPtr(-3), // HWND_MESSAGE
                 });
-                _clipboardHost.AddHook((IntPtr hwnd, int msg, IntPtr w, IntPtr l, ref bool handled) =>
+                _messageHost.AddHook((IntPtr hwnd, int msg, IntPtr w, IntPtr l, ref bool handled) =>
                 {
-                    // Something else replaced our clipboard content: the items can be hidden again.
-                    if (msg == Native.WM_CLIPBOARDUPDATE && _clipboardVisible.Count > 0 &&
-                        Native.GetClipboardSequenceNumber() != _clipboardSeq)
-                    {
-                        _clipboardVisible.Clear();
-                        Reconcile();
-                    }
-                    else if (msg == Native.WM_HOTKEY)
+                    if (msg == Native.WM_HOTKEY)
                     {
                         if (w.ToInt32() == HotkeySearch) ShowGlobalSearch();
-                        else if (w.ToInt32() == HotkeyPeek) TogglePeek();
+                        else if (w.ToInt32() == HotkeyDesktop) ToggleDesktop();
                     }
                     return IntPtr.Zero;
                 });
-                Native.AddClipboardFormatListener(_clipboardHost.Handle);
-                // Global hotkeys: Ctrl+Alt+F search every fence, Ctrl+Alt+D peek at the fences.
+                // Global hotkeys: Ctrl+Alt+F search every fence, Ctrl+Alt+D show the desktop.
                 const uint mods = Native.MOD_CONTROL | Native.MOD_ALT | Native.MOD_NOREPEAT;
-                if (!Native.RegisterHotKey(_clipboardHost.Handle, HotkeySearch, mods, 0x46))
+                if (!Native.RegisterHotKey(_messageHost.Handle, HotkeySearch, mods, 0x46))
                     Log.Error(new InvalidOperationException("Ctrl+Alt+F is already taken by another app"));
-                if (!Native.RegisterHotKey(_clipboardHost.Handle, HotkeyPeek, mods, 0x44))
+                if (!Native.RegisterHotKey(_messageHost.Handle, HotkeyDesktop, mods, 0x44))
                     Log.Error(new InvalidOperationException("Ctrl+Alt+D is already taken by another app"));
             }
             catch (Exception ex) { Log.Error(ex); }
@@ -624,6 +1167,7 @@ namespace Desko.Core
                 created++;
             }
             if (created > 0) TidyDesktop(null, quiet: true);
+            QueueSync(user: false); // loose icons under the new fences make room
             SaveSoon();
             return created;
         }
@@ -636,13 +1180,12 @@ namespace Desko.Core
         // structural change. File operations are not included; Explorer's own Ctrl+Z covers those.
         sealed record UndoEntry(string Description, string Snapshot);
         readonly List<UndoEntry> _undo = new();
-        public Action<string, string>? Notify { get; set; }
 
         public string? UndoDescription => _undo.Count > 0 ? _undo[^1].Description : null;
 
         public void Checkpoint(string description)
         {
-            var snapshot = new AppConfig { Fences = Config.Fences, VirtualIcons = Config.VirtualIcons };
+            var snapshot = new AppConfig { Fences = Config.Fences };
             _undo.Add(new UndoEntry(description, System.Text.Json.JsonSerializer.Serialize(snapshot, ConfigJson.Default.AppConfig)));
             if (_undo.Count > 25) _undo.RemoveAt(0);
         }
@@ -651,7 +1194,7 @@ namespace Desko.Core
         {
             if (_undo.Count == 0)
             {
-                Notify?.Invoke("Desko", "Không còn thao tác nào để hoàn tác.");
+                Tell("Desko", "Không còn thao tác nào để hoàn tác.");
                 return;
             }
             var entry = _undo[^1];
@@ -659,52 +1202,47 @@ namespace Desko.Core
             var snapshot = System.Text.Json.JsonSerializer.Deserialize(entry.Snapshot, ConfigJson.Default.AppConfig);
             if (snapshot == null) return;
 
-            EndPeek();
+            var before = NormalFences.SelectMany(f => f.Members).ToHashSet(StringComparer.OrdinalIgnoreCase);
             foreach (var w in _windows.ToList())
             {
                 w.ClosingByManager = true;
                 w.Close();
             }
             Config.Fences = snapshot.Fences;
-            Config.VirtualIcons = snapshot.VirtualIcons;
-            Reconcile();
+            var after = NormalFences.SelectMany(f => f.Members).ToHashSet(StringComparer.OrdinalIgnoreCase);
             foreach (var group in Config.Fences.GroupBy(GroupKey).ToList())
                 OpenWindow(group.FirstOrDefault(t => t.ActiveTab) ?? group.First(), rename: false);
+            ReleaseIcons(before.Where(n => !after.Contains(n)), all: false);
+            LayoutAll();
+            QueueSync(user: false);
             SaveNow();
-            Notify?.Invoke("Đã hoàn tác", entry.Description);
+            Tell("Đã hoàn tác", entry.Description);
         }
 
         #endregion
 
-        #region Peek & global search
+        #region Show desktop & global search
 
-        const int HotkeySearch = 1, HotkeyPeek = 2;
-        PeekOverlay? _peekOverlay;
-        public bool Peeking => _peekOverlay != null;
+        const int HotkeySearch = 1, HotkeyDesktop = 2;
 
-        public void TogglePeek()
+        // Same as Win+D: the windows step aside and the fences (on the desktop) are in full view.
+        public static void ToggleDesktop()
         {
-            if (Peeking) EndPeek();
-            else BeginPeek();
+            try
+            {
+                var type = Type.GetTypeFromProgID("Shell.Application");
+                if (type == null) return;
+                var shell = Activator.CreateInstance(type);
+                try { type.InvokeMember("ToggleDesktop", BindingFlags.InvokeMethod, null, shell, null); }
+                finally { if (shell != null) Marshal.ReleaseComObject(shell); }
+            }
+            catch (Exception ex) { Log.Error(ex); }
         }
 
-        // Lifts every fence above all windows over a dimmed screen.
-        public void BeginPeek()
+        static bool DesktopInFront()
         {
-            if (Peeking) return;
-            if (Hidden) SetHidden(false);
-            _peekOverlay = new PeekOverlay(EndPeek);
-            _peekOverlay.ShowOverlay();
-            foreach (var w in _windows) w.SetPeek(true); // after the overlay, so they land above it
-        }
-
-        public void EndPeek()
-        {
-            if (_peekOverlay == null) return;
-            var overlay = _peekOverlay;
-            _peekOverlay = null;
-            foreach (var w in _windows) w.SetPeek(false);
-            overlay.Close();
+            var cls = Native.ClassOf(Native.GetForegroundWindow());
+            return cls is "Progman" or "WorkerW" or "Shell_TrayWnd";
         }
 
         public void ShowGlobalSearch()
@@ -712,20 +1250,26 @@ namespace Desko.Core
             var results = new List<SearchWindow.Result>();
             foreach (var f in Config.Fences)
             {
-                IEnumerable<string> paths;
+                List<string> paths;
                 try
                 {
                     paths = f.IsPortal
                         ? Directory.Exists(f.FolderPath) ? Directory.EnumerateFileSystemEntries(f.FolderPath).Take(3000).ToList() : new List<string>()
-                        : f.Members.Select(n => Path.Combine(Desktop, n)).Where(Exists).ToList();
+                        : f.Members.Select(DesktopShell.MemberPath).OfType<string>().ToList();
                 }
                 catch (Exception ex) { Log.Error(ex); continue; }
 
                 foreach (var path in paths)
                 {
-                    FileSystemInfo info = Directory.Exists(path) ? new DirectoryInfo(path) : new FileInfo(path);
-                    if (f.IsPortal && (info.Attributes & (FileAttributes.Hidden | FileAttributes.System)) != 0) continue;
-                    string name = ShellInfo.GetDisplayNameCached(path, info.LastWriteTimeUtc, Path.GetFileName(path));
+                    string name;
+                    if (path.StartsWith("shell:", StringComparison.OrdinalIgnoreCase))
+                        name = VirtualItems.DisplayName(path) ?? path;
+                    else
+                    {
+                        FileSystemInfo info = Directory.Exists(path) ? new DirectoryInfo(path) : new FileInfo(path);
+                        if (f.IsPortal && (info.Attributes & (FileAttributes.Hidden | FileAttributes.System)) != 0) continue;
+                        name = ShellInfo.GetDisplayNameCached(path, info.LastWriteTimeUtc, Path.GetFileName(path));
+                    }
                     results.Add(new SearchWindow.Result
                     {
                         Path = path,
@@ -741,25 +1285,27 @@ namespace Desko.Core
 
         public void OpenPath(string path)
         {
-            EndPeek();
             try
             {
-                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(path)
+                bool shellItem = path.StartsWith("shell:", StringComparison.OrdinalIgnoreCase);
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(shellItem ? "explorer.exe" : path)
                 {
                     UseShellExecute = true,
-                    WorkingDirectory = Path.GetDirectoryName(path) ?? "",
+                    Arguments = shellItem ? path : "",
+                    WorkingDirectory = shellItem ? "" : Path.GetDirectoryName(path) ?? "",
                 });
             }
             catch (System.ComponentModel.Win32Exception ex) when (ex.NativeErrorCode == 1223) { }
             catch (Exception ex) { Dialogs.Info("Không mở được", ex.Message); }
         }
 
-        // Shows an item in its fence: lifts the fences, opens the right tab and selects the item.
+        // Shows an item in its fence: brings the desktop forward, opens the right tab and selects the item.
         public void Reveal(FenceConfig tab, string path)
         {
             var window = _windows.FirstOrDefault(w => TabsOf(w.Config).Contains(tab));
             if (window == null) return;
-            BeginPeek();
+            if (Hidden) SetHidden(false);
+            if (!DesktopInFront()) ToggleDesktop();
             window.SwitchTab(tab);
             window.RevealItem(path);
         }
@@ -768,39 +1314,44 @@ namespace Desko.Core
 
         #region Membership
 
-        public void AddMembers(FenceConfig fence, IReadOnlyCollection<string> names, int index)
+        public static string MemberName(string path) =>
+            path.StartsWith("shell:", StringComparison.OrdinalIgnoreCase) ? path.Substring(6) : Path.GetFileName(path.TrimEnd('\\'));
+
+        // Puts desktop icons into a fence (taking them out of any other one), at the slot under `at` if given.
+        public void AddMembers(FenceConfig fence, IReadOnlyCollection<string> names, Native.POINT? at, bool layout = true)
         {
             if (names.Count == 0) return;
+            var set = names.ToHashSet(StringComparer.OrdinalIgnoreCase);
             foreach (var other in NormalFences.Where(f => f != fence))
             {
-                other.Members.RemoveAll(n => names.Contains(n, StringComparer.OrdinalIgnoreCase));
-                other.Order.RemoveAll(n => names.Contains(n, StringComparer.OrdinalIgnoreCase));
+                other.Members.RemoveAll(set.Contains);
+                other.Order.RemoveAll(set.Contains);
             }
             foreach (var n in names)
                 if (!fence.Members.Contains(n, StringComparer.OrdinalIgnoreCase)) fence.Members.Add(n);
 
-            var order = fence.Order.Where(n => !names.Contains(n, StringComparer.OrdinalIgnoreCase)).ToList();
-            order.InsertRange(Math.Clamp(index, 0, order.Count), names);
-            fence.Order = order;
-
-            Reconcile();
-            RefreshNormalFences();
+            var window = _windows.FirstOrDefault(w => w.Config == fence);
+            if (at is Native.POINT p && window != null) window.InsertAt(names, p);
+            else
+            {
+                var order = fence.Order.Where(n => !set.Contains(n)).ToList();
+                order.AddRange(names);
+                fence.Order = order;
+            }
+            foreach (var w in _windows) w.ScheduleReload();
             SaveSoon();
-        }
-
-        public void RemoveMembers(FenceConfig fence, IEnumerable<string> names)
-        {
-            var set = new HashSet<string>(names, StringComparer.OrdinalIgnoreCase);
-            fence.Members.RemoveAll(set.Contains);
-            fence.Order.RemoveAll(set.Contains);
-            Reconcile();
-            RefreshNormalFences();
-            SaveSoon();
+            if (layout)
+            {
+                foreach (var w in _windows) w.RefreshIconOrder();
+                LayoutAll();
+            }
         }
 
         public void RenameMember(string? oldName, string? newName)
         {
             if (string.IsNullOrEmpty(oldName) || string.IsNullOrEmpty(newName)) return;
+            if (_placed.Remove(oldName, out var placed)) _placed[newName] = placed;
+            if (_seen.Remove(oldName, out var seen)) _seen[newName] = seen;
             foreach (var f in NormalFences)
             {
                 int i = f.Members.FindIndex(n => string.Equals(n, oldName, StringComparison.OrdinalIgnoreCase));
@@ -832,16 +1383,16 @@ namespace Desko.Core
 
         // Drop/paste into a normal fence: items already on the Desktop just join the fence,
         // anything else is moved or copied onto the Desktop first (as the original does).
-        public void ImportToDesktop(FenceConfig fence, IReadOnlyList<string> files, bool copy, int index, IntPtr owner)
+        public void ImportToDesktop(FenceConfig fence, IReadOnlyList<string> files, bool copy, Native.POINT? at, IntPtr owner)
         {
-            var onDesktop = files.Where(f => PathEquals(Path.GetDirectoryName(f.TrimEnd('\\')), Desktop)).ToList();
+            var onDesktop = files.Where(IsDesktopItem).ToList();
             var others = files.Except(onDesktop).ToList();
             var names = new List<string>();
 
             if (copy)
             {
                 var before = DesktopSnapshot();
-                WithVisible(files, () => FileOps.Copy(files, Desktop, owner, renameOnCollision: onDesktop.Count > 0));
+                FileOps.Copy(files, Desktop, owner, renameOnCollision: onDesktop.Count > 0);
                 names.AddRange(DesktopSnapshot().Where(n => !before.Contains(n)));
             }
             else
@@ -850,14 +1401,21 @@ namespace Desko.Core
                 if (others.Count > 0)
                 {
                     var before = DesktopSnapshot();
-                    WithVisible(others, () => FileOps.Move(others, Desktop, owner));
+                    FileOps.Move(others, Desktop, owner);
                     names.AddRange(DesktopSnapshot().Where(n => !before.Contains(n)));
                     names.AddRange(others.Select(f => Path.GetFileName(f.TrimEnd('\\')))
                                          .Where(n => Exists(Path.Combine(Desktop, n))));
                     ForgetMissing(others);
                 }
             }
-            AddMembers(fence, names.Distinct(StringComparer.OrdinalIgnoreCase).ToList(), index);
+            AddMembers(fence, names.Distinct(StringComparer.OrdinalIgnoreCase).ToList(), at);
+            QueueSync(user: false); // new files reach the desktop view a moment later
+        }
+
+        public static bool IsDesktopItem(string path)
+        {
+            string? parent = Path.GetDirectoryName(path.TrimEnd('\\'));
+            return PathEquals(parent, Desktop) || PathEquals(parent, DesktopShell.PublicDesktopPath);
         }
 
         static HashSet<string> DesktopSnapshot()
@@ -884,14 +1442,15 @@ namespace Desko.Core
             w.Closed += (_, _) => OnWindowClosed(w);
             _windows.Add(w);
             w.Show();
-            if (Hidden) w.Hide();
+            if (Hidden) w.HideFence();
             return w;
         }
 
-        // If Explorer restarts it can take our (Progman-owned) windows down with it; bring them back.
+        // If Explorer restarts it takes our (Progman-owned) windows down with it; bring them back.
         void OnWindowClosed(FenceWindow w)
         {
             _windows.Remove(w);
+            UpdateZones();
             if (_shuttingDown || w.ClosingByManager || !Config.Fences.Contains(w.Config)) return;
             var timer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(2) };
             timer.Tick += (_, _) =>
@@ -900,6 +1459,7 @@ namespace Desko.Core
                 timer.Stop();
                 if (!_shuttingDown && Config.Fences.Contains(w.Config) && _windows.All(x => x.Config != w.Config))
                     OpenWindow(w.Config, rename: false);
+                ExplorerRestarted();
             };
             timer.Start();
         }
@@ -916,7 +1476,9 @@ namespace Desko.Core
             }
             Config.Fences.Add(f);
             SaveSoon();
-            return OpenWindow(f, rename);
+            var w = OpenWindow(f, rename);
+            QueueSync(user: false); // icons under the new fence make room
+            return w;
         }
 
         public void CreateFenceAtCursor()
@@ -970,12 +1532,12 @@ namespace Desko.Core
                         : wholeFence ? $"fence \"{f.Title}\"" : $"tab \"{f.Title}\"";
             string msg = removing.All(t => t.IsPortal)
                 ? $"Gỡ {what}?\nThư mục gốc vẫn được giữ nguyên."
-                : $"Xóa {what}?\nCác mục bên trong sẽ hiện lại trên Desktop (không file nào bị xóa).";
+                : $"Xóa {what}?\nCác icon bên trong vẫn ở lại trên Desktop (không file nào bị xóa).";
             if (!Dialogs.Confirm(wholeFence ? "Xóa fence" : "Xóa tab", msg)) return;
-            Checkpoint(wholeFence ? $"Xóa {what}" : $"Xóa {what}");
+            Checkpoint($"Xóa {what}");
 
             foreach (var t in removing) Config.Fences.Remove(t);
-            Reconcile();
+            var released = removing.Where(t => !t.IsPortal).SelectMany(t => t.Members).ToList();
 
             var remaining = tabs.Except(removing).ToList();
             if (remaining.Count > 0)
@@ -983,12 +1545,15 @@ namespace Desko.Core
                 if (remaining.Count == 1) remaining[0].GroupId = "";
                 w.SwitchTab(remaining[0]);
                 w.RebuildTabs();
+                ReleaseIcons(released, all: true, from: f); // the fence stays: its old icons must make room
             }
             else
             {
                 w.ClosingByManager = true;
                 w.Close();
+                ReleaseIcons(released, all: false, from: f); // they stay where the fence was
             }
+            LayoutAll();
             SaveSoon();
         }
 
@@ -1008,22 +1573,23 @@ namespace Desko.Core
             {
                 if (f.Members.Count > 0 &&
                     !Dialogs.Confirm("Chuyển thành Folder Portal",
-                        "Các mục đang có trong fence sẽ hiện lại trên Desktop. Tiếp tục?")) return;
+                        "Các icon đang có trong fence sẽ được đưa ra ngoài Desktop. Tiếp tục?")) return;
                 Checkpoint($"Chuyển \"{f.Title}\" thành Folder Portal");
+                var released = f.Members.ToList();
                 f.Members.Clear();
                 f.Title = new DirectoryInfo(folder).Name;
+                f.IsPortal = true;
+                ReleaseIcons(released, all: true, from: f);
             }
             f.IsPortal = true;
             f.FolderPath = folder;
             f.Order.Clear();
-            Reconcile();
-            w.RestartWatcher();
-            w.ApplyAppearance();
-            w.Reload();
+            w.ModeChanged();
+            LayoutAll();
             SaveSoon();
         }
 
-        // Version 1.0 moved fenced files into %USERPROFILE%\Desko\<fence>. Bring them back
+        // Version 1.0 moved fenced files into %USERPROFILE%\DeskFences\<fence>. Bring them back
         // to the Desktop, keeping them in the same fence.
         void MigrateLegacyFences()
         {
@@ -1066,25 +1632,26 @@ namespace Desko.Core
 
         public void ToggleHidden() => SetHidden(!Hidden);
 
+        // Double-click on the desktop: fences and every desktop icon go away (and come back) together.
         public void SetHidden(bool hide)
         {
             if (Hidden == hide) return;
             Hidden = hide;
             foreach (var w in _windows)
             {
-                if (hide) w.FadeTo(0, () => { if (Hidden) w.Hide(); });
+                if (hide) w.FadeTo(0, () => { if (Hidden) w.HideFence(); });
                 else
                 {
-                    w.Show();
+                    w.ShowFence();
                     w.FadeTo(1);
                 }
             }
 
-            if (hide && Config.HideIconsToo && DesktopShell.IconsVisible)
+            if (hide && DesktopShell.IconsVisible)
             {
-                DesktopShell.SetIconsVisible(false);
                 Config.IconsHiddenByUs = true;
                 SaveNow();
+                DesktopShell.SetIconsVisible(false);
             }
             else if (!hide && Config.IconsHiddenByUs)
             {
@@ -1092,6 +1659,8 @@ namespace Desko.Core
                 Config.IconsHiddenByUs = false;
                 SaveNow();
             }
+            UpdateZones();
+            if (!hide) QueueSync(user: false); // whatever changed on the desktop meanwhile
         }
 
         #endregion
@@ -1105,19 +1674,17 @@ namespace Desko.Core
                 var w = new FileSystemWatcher(Desktop)
                 {
                     IncludeSubdirectories = false,
-                    NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName |
-                                   NotifyFilters.Attributes | NotifyFilters.LastWrite,
+                    NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName,
                 };
-                // Only changes to fenced items need a refresh; a download in progress elsewhere on the
-                // Desktop would otherwise refresh every fence several times a second.
-                w.Created += (_, e) => UI.BeginInvoke(() => { if (IsFenced(e.Name)) DesktopChanged(); QueueTidy(e.FullPath); });
-                w.Deleted += (_, e) => UI.BeginInvoke(() => { if (IsFenced(e.Name)) DesktopChanged(); });
-                w.Changed += (_, e) => UI.BeginInvoke(() => { if (IsFenced(e.Name)) DesktopChanged(); });
+                // New, removed or renamed items: their icons appear / disappear in the view a moment later.
+                w.Created += (_, e) => UI.BeginInvoke(() => { Log.Trace($"file created: {e.Name}"); WatchParked("a new file"); QueueSyncTwice(); QueueTidy(e.FullPath); });
+                w.Deleted += (_, e) => UI.BeginInvoke(() => { Log.Trace($"file deleted: {e.Name}"); WatchParked("a deleted file"); if (IsFenced(e.Name)) DesktopChanged(); });
                 w.Renamed += (_, e) => UI.BeginInvoke(() =>
                 {
-                    bool fenced = IsFenced(e.OldName) || IsFenced(e.Name);
+                    Log.Trace($"file renamed: {e.OldName} -> {e.Name}");
+                    WatchParked("a renamed file");
                     RenameMember(e.OldName, e.Name);
-                    if (fenced) DesktopChanged();
+                    DesktopChanged();
                     QueueTidy(e.FullPath);
                 });
                 w.Error += (_, _) => UI.BeginInvoke(() =>
@@ -1137,10 +1704,11 @@ namespace Desko.Core
             !string.IsNullOrEmpty(name) &&
             NormalFences.Any(f => f.Members.Contains(name, StringComparer.OrdinalIgnoreCase));
 
+        // A fenced item went away or an item was renamed: the fences close the gap / keep it in place.
         void DesktopChanged()
         {
-            _desktopTimer.Stop();
-            _desktopTimer.Start();
+            foreach (var w in _windows) w.RefreshIconOrder();
+            QueueSyncTwice();
         }
 
         void QueueTidy(string path)
@@ -1184,7 +1752,7 @@ namespace Desko.Core
             {
                 if (!fence.IsPortal)
                 {
-                    AddMembers(fence, list.Select(Path.GetFileName).OfType<string>().ToList(), int.MaxValue);
+                    AddMembers(fence, list.Select(Path.GetFileName).OfType<string>().ToList(), null);
                     sorted += list.Count;
                 }
                 else if (Directory.Exists(fence.FolderPath) &&

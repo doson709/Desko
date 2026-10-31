@@ -2,6 +2,11 @@
 #   Desko.exe, DeskoGuard.exe (watchdog), setup.bat, uninstall.bat, guide.
 # Needs the .NET 8 SDK; setup.bat installs the .NET 8 Desktop Runtime on machines that lack it.
 $ErrorActionPreference = 'Stop'
+# A running copy is asked to exit normally first: it puts its parked icons back itself. Killing it would make its
+# watchdog do that instead, possibly while the new build is already starting.
+if ((Get-Process Desko -ErrorAction SilentlyContinue) -and (Test-Path "$PSScriptRoot\dist\Desko.exe")) {
+    Start-Process "$PSScriptRoot\dist\Desko.exe" -ArgumentList "--exit" -Wait
+}
 Get-Process Desko, DeskoGuard -ErrorAction SilentlyContinue | Stop-Process -Force
 # Start from an empty folder so nothing from an older build (or the pre-2.0 DeskFences name) ends up in the zip.
 Remove-Item "$PSScriptRoot\dist" -Recurse -Force -ErrorAction SilentlyContinue

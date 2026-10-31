@@ -78,8 +78,12 @@ namespace Desko.UI
             return result;
         }
 
+        // Set only through the test channel (Core/TestChannel), so tests never wait on a dialog.
+        public static bool? TestAnswer;
+
         public static bool Confirm(string title, string message)
         {
+            if (TestAnswer is bool answer) return answer;
             bool ok = false;
             Build(title, message, null, () => ok = true, "Đồng ý", cancel: true).ShowDialog();
             return ok;

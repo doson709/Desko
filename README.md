@@ -25,29 +25,28 @@
 
 *Desko organizes the Windows desktop into fences: frosted panels that group icons, roll up, merge into tabs and hide with a double-click. Windows 10/11, C# / WPF on .NET 8. The interface is in Vietnamese.*
 
-> **File của bạn không bao giờ bị di chuyển hay xóa.** File trong fence vẫn nằm nguyên trên Desktop; Desko chỉ tạm ẩn icon của chúng khỏi desktop để hiển thị trong fence, và trả lại ngay khi ứng dụng thoát, kể cả khi bị tắt đột ngột.
+> **Fence chứa chính icon của desktop.** File không bị di chuyển, ẩn hay xóa: File Explorer, hộp thoại mở / lưu file và trang web khi tải file lên đều thấy đầy đủ thư mục Desktop. Mở, chọn, đổi tên, kéo thả, menu chuột phải trong fence đều là của Windows.
 
 ## Tính năng
 
 **Fence**
 - Tạo fence bằng cách giữ **chuột phải và kéo một khung** trên vùng trống của desktop.
-- Kéo icon vào fence; kéo ra desktop để bỏ khỏi fence (icon về đúng chỗ thả). Thả lên giữa một thư mục trong fence để chuyển file vào thư mục đó.
+- Kéo icon vào fence (icon vào đúng ô được thả, fence sáng viền khi kéo qua); kéo ra desktop để bỏ khỏi fence. Thả lên giữa một thư mục trong fence để chuyển file vào thư mục đó.
+- **Cuộn** bằng con lăn khi fence có nhiều icon hơn chỗ chứa.
 - **Tab**: kéo một fence thả lên fence khác để gộp; menu chuột phải để thêm, tách hoặc xóa tab.
 - **Folder Portal**: fence hiển thị nội dung một thư mục bất kỳ; nhấp đúp thư mục con để duyệt ngay trong fence, Backspace để quay lại. Thư mục hàng nghìn file vẫn mượt (chỉ dựng các icon đang nhìn thấy).
 - **Quy tắc tự sắp xếp**: ví dụ ảnh vào fence "Ảnh", PDF vào "Tài liệu"; dọn desktop một lần hoặc tự động cho file mới.
-- **Thu gọn** bằng nhấp đúp thanh tiêu đề; rê chuột vào để xem nhanh. **Ẩn / hiện mọi fence** bằng nhấp đúp vùng trống desktop.
+- **Thu gọn** bằng nhấp đúp thanh tiêu đề; rê chuột vào để xem nhanh. **Ẩn / hiện mọi fence và icon** bằng nhấp đúp vùng trống desktop.
 - Kéo mép để đổi kích thước: tự **căn vừa số cột/hàng icon**, bắt dính vào mép màn hình, fence khác và lưới.
 - Nhớ **bố cục riêng cho từng cấu hình màn hình** (laptop, laptop + màn hình phụ, đổi độ phân giải).
 
 **Làm việc với file**
-- Menu chuột phải gốc của Windows (Open with, Send to, 7-Zip, Properties...).
-- Đổi tên ngay tại icon (F2 hoặc nhấp chậm), chọn nhiều bằng kéo khung, Delete / Ctrl+C / Ctrl+X / Ctrl+V.
-- Gõ chữ trong fence để lọc icon, không cần gõ dấu ("dao tao" tìm được "đào tạo").
-- Mọi thao tác file đi qua shell của Windows: hộp thoại trùng tên, Thùng rác và Ctrl+Z của Explorer vẫn dùng được.
+- Icon trong fence là icon thật của desktop: chọn nhiều bằng kéo khung (cả giữa các fence), F2, Delete, Ctrl+C / Ctrl+V, menu chuột phải của Windows, cỡ icon của desktop.
+- Tạo mới (New ▸ Folder...) hoặc dán ngay trong fence thì mục mới nằm trong fence đó; file do ứng dụng khác lưu ra desktop thì không tự lọt vào fence.
+- Icon ngoài fence vẫn được căn theo lưới như "Align icons to grid".
 
 **Giao diện**
-- Nền kính mờ Acrylic (hoặc Blur / trong suốt), góc bo kiểu Windows 11, theo chế độ sáng/tối và màu nhấn của Windows.
-- Icon cùng cỡ với icon desktop; hiệu ứng mượt khi hiện icon, rê chuột, thu gọn/mở fence.
+- Nền kính mờ Acrylic (hoặc Blur / trong suốt) vẽ từ chính hình nền desktop, nằm dưới các icon; góc bo kiểu Windows 11; theo chế độ sáng/tối và màu nhấn của Windows.
 - Cửa sổ Cài đặt áp dụng thay đổi ngay; hướng dẫn lần đầu có thể tạo sẵn các fence gợi ý từ desktop hiện tại.
 
 ## Phím tắt
@@ -55,10 +54,9 @@
 | Phím | Tác dụng |
 |---|---|
 | `Ctrl` + `Alt` + `F` | Tìm trong mọi fence (Enter mở, Ctrl+Enter chỉ vị trí trong fence) |
-| `Ctrl` + `Alt` + `D` | Nhìn trộm: đưa mọi fence lên trên các cửa sổ khác |
-| Gõ chữ trong fence | Lọc icon (Esc để xóa) |
-| `F2` | Đổi tên tại icon |
-| `Ctrl` + `Z` | Hoàn tác thao tác với fence (xóa, gộp, tách tab, chuyển portal...) |
+| `Ctrl` + `Alt` + `D` | Xem desktop (như Win + D) |
+| Gõ chữ trong Folder Portal | Lọc icon, không cần gõ dấu (Esc để xóa) |
+| `Ctrl` + `Z` | Hoàn tác thao tác với fence (xóa, gộp, tách tab, chuyển portal, kéo icon vào / ra...) |
 | `Backspace` | Quay lại thư mục trước trong Folder Portal |
 
 ## Cài đặt (người dùng)
@@ -92,12 +90,13 @@ Kết quả nằm trong `dist\`, sẵn sàng nén zip để chia sẻ:
 
 ## Cách hoạt động
 
-- **Ẩn icon khỏi desktop**: fence thường không chuyển file đi đâu cả. Ứng dụng bật thuộc tính *Hidden* cho file trên Desktop để Explorer không vẽ icon, còn fence hiển thị file đó. Mọi file đã ẩn được ghi vào `HiddenByUs` trong config *trước khi* ẩn.
-- **Luôn trả file về**: khi thoát, ứng dụng gỡ ẩn tất cả. Nếu bị tắt đột ngột, `DeskoGuard` (chạy kèm, chờ ứng dụng chính) gỡ ẩn ngay; nếu cả hai cùng chết (mất điện) và ứng dụng không tự khởi động, một lệnh `--restore` được đăng ký chạy lúc đăng nhập.
-- **Không để bản copy bị ẩn theo**: Windows chép cả thuộc tính Hidden, nên khi kéo file ra ngoài, copy, cắt hay xóa, ứng dụng tạm gỡ ẩn file trước.
-- **Recycle Bin, This PC...** được đưa vào fence dưới dạng shortcut, icon gốc trên desktop được tạm tắt (cùng công tắc với Desktop icon settings).
-- **Fence là cửa sổ nằm ở lớp desktop** (owned by `Progman`), không bị Win+D làm ẩn; nền kính mờ do DWM vẽ, nội dung vẽ bằng CPU để tiết kiệm RAM (có thể bật GPU trong Cài đặt).
+- **Icon thật, đặt đúng chỗ**: mỗi fence xếp các icon thành viên của nó lên lưới icon của desktop, bằng chính giao diện `IFolderView` mà Explorer dùng để đặt icon. Muốn vậy desktop phải tắt "Auto arrange icons" và "Align icons to grid"; Desko tắt chúng khi chạy và gỡ cài đặt sẽ trả lại. Icon không được hiện (fence thu gọn, tab khác, hàng đang cuộn khuất) được đặt tạm ra xa ngoài màn hình.
+- **Ba lớp cho mỗi fence**: nền kính mờ là một cửa sổ con của desktop nằm *giữa hình nền và lớp icon* (Windows không làm mờ được ở đó, nên Desko tự vẽ phần hình nền bên dưới, đã làm mờ sẵn); icon của Windows nằm trên; trên cùng là một cửa sổ trong suốt chỉ nhận chuột ở thanh tiêu đề và mép, nên click vào vùng icon đi thẳng tới desktop.
+- **Theo dõi desktop**: hook chuột cấp thấp biết khi bạn kéo icon (rồi đối chiếu vị trí icon để biết icon vào / ra fence nào), cuộn trong fence, hay đang kéo thả ngang qua fence (khi đó fence tạm nhận cú thả để đặt icon đúng ô và vẫn chuyển được vào thư mục trong fence). Thay đổi file trên Desktop và việc Explorer tự dựng lại danh sách icon (F5, đổi cỡ icon...) cũng được theo dõi để xếp lại ngay.
+- **Luôn trả icon về**: khi thoát, mọi icon đang cất ngoài màn hình được đưa về chỗ trống gần fence của nó. Nếu bị tắt đột ngột, `DeskoGuard` (chạy kèm, chờ ứng dụng chính) gọi `Desko.exe --restore` làm việc đó; nếu cả hai cùng chết (mất điện) và ứng dụng không tự khởi động, `--restore` được đăng ký chạy lúc đăng nhập.
+- **Fence là cửa sổ của lớp desktop** (owned by `Progman`), không bị Win+D làm ẩn.
 - **Tự khởi động** bằng tác vụ đăng nhập của Task Scheduler (không bị Windows trì hoãn như khóa Run).
+- **Nâng cấp từ bản 2.x**: bản cũ ẩn file bằng thuộc tính *Hidden* và thay Recycle Bin, This PC bằng shortcut; lần chạy đầu Desko gỡ ẩn, xóa các shortcut đó và đưa chính các icon vào fence.
 
 ## Dữ liệu và dòng lệnh
 
@@ -105,26 +104,28 @@ Kết quả nằm trong `dist\`, sẵn sàng nén zip để chia sẻ:
 |---|---|
 | `%APPDATA%\Desko\config.json` | Fence, tab, quy tắc, bố cục theo màn hình, cài đặt |
 | `%APPDATA%\Desko\error.log` | Lỗi (tự xoay vòng khi quá 1 MB) |
-| `%LOCALAPPDATA%\Desko\iconcache\` | Icon đã dựng sẵn, giúp mở máy là icon hiện ngay |
+| `%LOCALAPPDATA%\Desko\iconcache\` | Icon đã dựng sẵn cho Folder Portal và tìm kiếm |
 
 | Lệnh | Tác dụng |
 |---|---|
 | `Desko.exe` | Chạy; nếu đang chạy rồi thì mở Cài đặt |
 | `Desko.exe --welcome` | Mở hướng dẫn lần đầu |
-| `Desko.exe --exit` | Yêu cầu bản đang chạy thoát bình thường (trả file về desktop) |
+| `Desko.exe --exit` | Yêu cầu bản đang chạy thoát bình thường (trả icon về) |
 | `Desko.exe --autostart on\|off` | Bật / tắt khởi động cùng Windows |
-| `Desko.exe --restore` | Gỡ ẩn mọi file nếu ứng dụng không chạy |
-| `Desko.exe --uninstall` | Thoát, trả file về, bỏ khởi động cùng Windows (dùng bởi `uninstall.bat`) |
+| `Desko.exe --restore` | Trả mọi icon đang cất về desktop nếu ứng dụng không chạy |
+| `Desko.exe --uninstall` | Thoát, trả icon về, trả lại cách sắp xếp icon cũ của desktop, bỏ khởi động cùng Windows (dùng bởi `uninstall.bat`) |
 
 ## Cấu trúc mã nguồn
 
 ```
 App.xaml(.cs), Program.cs   Khởi động, các chế độ dòng lệnh, một phiên bản duy nhất
-Core/        FenceManager (fence, tab, ẩn/hiện, quy tắc, hoàn tác), DesktopHook (chuột trên desktop),
-             Recovery (canh gác, khôi phục), AutoStart, DisplayLayouts, Snapper, Rules
-Shell/       Icon và cache, menu chuột phải của Windows, kéo thả kiểu Explorer, thao tác file,
-             đặt vị trí icon desktop, mục ảo (Recycle Bin...)
-UI/          FenceWindow, Cài đặt, Hướng dẫn, Tìm kiếm, Nhìn trộm, khay hệ thống, giao diện theo theme
+Core/        FenceManager (fence, tab, đối chiếu icon, ẩn/hiện, quy tắc, hoàn tác), DesktopHook (chuột),
+             IconGrid (lưới icon), Recovery (canh gác, khôi phục), AutoStart, DisplayLayouts, Snapper, Rules,
+             TestChannel (điều khiển cho kiểm thử, chỉ bật khi đặt DESKO_TEST_PIPE)
+Shell/       DesktopIcons (đặt / cất icon thật của desktop), DesktopEvents, icon và cache, menu chuột phải,
+             kéo thả kiểu Explorer, thao tác file, mục ảo (Recycle Bin...)
+UI/          FenceWindow (+ .Icons), FenceBackdrop (nền dưới lớp icon), Wallpaper, Cài đặt, Hướng dẫn,
+             Tìm kiếm, khay hệ thống, giao diện theo theme
 Interop/     Khai báo Win32
 Guard/       DeskoGuard: tiến trình canh gác Native AOT
 installer/   setup.bat, uninstall.bat, hướng dẫn cho người dùng
@@ -132,11 +133,11 @@ installer/   setup.bat, uninstall.bat, hướng dẫn cho người dùng
 
 ## Hạn chế đã biết
 
-- Nếu bật **Show hidden items** trong Explorer, file trong fence sẽ hiện mờ trên desktop.
-- Sau khi **Ctrl+C** một file trong fence, icon của nó hiện tạm trên desktop cho đến khi bạn copy thứ khác (để bản dán không bị ẩn).
-- Kéo khung chọn từ desktop không chọn được icon nằm trong fence.
-- Góc bo do ứng dụng tự cắt (để bỏ bóng đổ của Windows 11) không được khử răng cưa.
-- Một số phần mềm diệt virus có thể nghi ngờ vì ứng dụng theo dõi chuột trên desktop và đổi thuộc tính file.
+- Desktop phải tắt "Auto arrange icons" và "Align icons to grid" (Desko tự làm, và tự căn icon ngoài fence theo lưới).
+- Fence cuộn theo từng hàng icon (Windows không cho cắt một icon làm đôi ở mép fence).
+- Icon đang được cất (fence thu gọn, tab khác, hàng cuộn khuất) vẫn là icon của desktop: **Ctrl+A** trên desktop cũng chọn chúng. Sau F5, chúng có thể hiện thoáng qua khoảng nửa giây trước khi được cất lại.
+- Góc bo của nền fence không được khử răng cưa.
+- Một số phần mềm diệt virus có thể nghi ngờ vì ứng dụng theo dõi chuột trên desktop.
 
 ## Giấy phép
 

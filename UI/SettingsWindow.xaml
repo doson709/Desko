@@ -23,7 +23,7 @@
                         <RadioButton Content="Làm mờ (Blur)" Tag="Blur" GroupName="backdrop" Checked="Backdrop_Checked"/>
                         <RadioButton Content="Trong suốt" Tag="Clear" GroupName="backdrop" Checked="Backdrop_Checked"/>
                     </WrapPanel>
-                    <TextBlock Text="Nếu kéo fence thấy giật, hãy thử “Làm mờ”." Foreground="{DynamicResource FgSubtle}" FontSize="12" Margin="0,6,0,6"/>
+                    <TextBlock Text="Nền fence nằm dưới các icon và được vẽ từ hình nền desktop." Foreground="{DynamicResource FgSubtle}" FontSize="12" Margin="0,6,0,6"/>
                 </StackPanel>
             </Border>
             <Border Style="{StaticResource CardStyle}">
@@ -90,7 +90,7 @@
                     <TextBlock Grid.Row="0" Text="Ctrl + Alt + F" FontWeight="SemiBold" Margin="0,3"/>
                     <TextBlock Grid.Row="0" Grid.Column="1" Text="Tìm trong mọi fence" Margin="0,3"/>
                     <TextBlock Grid.Row="1" Text="Ctrl + Alt + D" FontWeight="SemiBold" Margin="0,3"/>
-                    <TextBlock Grid.Row="1" Grid.Column="1" Text="Nhìn trộm: đưa các fence lên trên mọi cửa sổ" Margin="0,3"/>
+                    <TextBlock Grid.Row="1" Grid.Column="1" Text="Xem desktop: thu nhỏ mọi cửa sổ (như Win + D)" Margin="0,3"/>
                     <TextBlock Grid.Row="2" Text="Gõ chữ trong fence" FontWeight="SemiBold" Margin="0,3"/>
                     <TextBlock Grid.Row="2" Grid.Column="1" Text="Lọc icon trong fence đó (Esc để xóa)" Margin="0,3"/>
                     <TextBlock Grid.Row="3" Text="F2" FontWeight="SemiBold" Margin="0,3"/>

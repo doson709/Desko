@@ -28,6 +28,7 @@ namespace Desko
                 case "--uninstall":
                     Recovery.RequestExit();
                     Recovery.RunRestore();
+                    Recovery.RestoreDesktopArrange();
                     AutoStart.Enabled = false;
                     AutoStart.SetRestoreEntry(false);
                     return;

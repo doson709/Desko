@@ -42,9 +42,10 @@ namespace Desko.UI
             foreach (var (text, get, set) in new (string, Func<bool>, Action<bool>)[]
             {
                 ("Nhấp đúp vùng trống desktop để ẩn / hiện fence", () => Cfg.DoubleClickToHide, v => Cfg.DoubleClickToHide = v),
-                ("Ẩn luôn icon desktop khi ẩn fence", () => Cfg.HideIconsToo, v => Cfg.HideIconsToo = v),
+                ("Tự xếp gọn icon ngoài fence (như Auto arrange)", () => Cfg.ArrangesLooseIcons, v => Cfg.AutoArrangeLoose = v),
+                ("Căn icon ngoài fence theo lưới", () => Cfg.AlignLooseIcons, v => Cfg.AlignLooseIcons = v),
                 ("Kéo chuột phải trên desktop để tạo fence", () => Cfg.RightDragToCreate, v => Cfg.RightDragToCreate = v),
-                ("Mở file bằng một cú nhấp", () => Cfg.SingleClickOpen, v => Cfg.SingleClickOpen = v),
+                ("Mở file bằng một cú nhấp (Folder Portal)", () => Cfg.SingleClickOpen, v => Cfg.SingleClickOpen = v),
                 ("Bắt dính lưới khi di chuyển fence", () => Cfg.SnapToGrid, v => Cfg.SnapToGrid = v),
                 ("Tự động xếp file mới trên desktop theo quy tắc của các fence", () => Cfg.AutoApplyRules, v => Cfg.AutoApplyRules = v),
             })

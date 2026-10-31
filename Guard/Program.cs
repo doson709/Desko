@@ -2,26 +2,22 @@ using System;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
-using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Threading;
-using Microsoft.Win32;
 
 namespace DeskoGuard
 {
     // Usage: DeskoGuard.exe <pid of Desko.exe>
-    // Mirrors Desko's Recovery.ReleaseAll, but only edits the fields it owns in config.json.
+    // Waits for Desko to exit. If it died without cleaning up (crash, Task Manager...), desktop icons may still
+    // be parked off screen or switched off: "Desko.exe --restore" (Recovery.RunRestore) brings them back.
+    // Stays tiny itself (Native AOT, no COM): the one-off restore runs in the full app.
     internal static class Program
     {
-        // Overridable only so tests can run the guard against a scratch config instead of the real one.
-        static readonly string MutexName = Environment.GetEnvironmentVariable("DESKO_GUARD_MUTEX") ?? @"Local\Desko.SingleInstance";
-        const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
-        const string HideIconsKey = @"Software\Microsoft\Windows\CurrentVersion\Explorer\HideDesktopIcons\NewStartPanel";
-        const int SHCNE_ATTRIBUTES = 0x800, SHCNE_ASSOCCHANGED = 0x08000000;
-        const uint SHCNF_PATHW = 0x5, SHCNF_FLUSHNOWAIT = 0x3000;
-        const int WM_COMMAND = 0x0111, WM_KEYDOWN = 0x0100, VK_F5 = 0x74, CmdToggleDesktopIcons = 0x7402;
+        // Overridable only so tests can run an isolated copy against a scratch config (same variables as Desko).
+        static readonly string MutexName = Environment.GetEnvironmentVariable("DESKO_GUARD_MUTEX") ??
+            $@"Local\Desko{Environment.GetEnvironmentVariable("DESKO_INSTANCE")}.SingleInstance";
+        const int WM_COMMAND = 0x0111, CmdToggleDesktopIcons = 0x7402;
 
-        [DllImport("shell32.dll", CharSet = CharSet.Unicode)] static extern void SHChangeNotify(int e, uint flags, string? a, IntPtr b);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr FindWindowEx(IntPtr parent, IntPtr after, string? cls, string? name);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr FindWindow(string? cls, string? name);
         [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr hwnd);
@@ -50,87 +46,31 @@ namespace DeskoGuard
         static void Release()
         {
             string config = Environment.GetEnvironmentVariable("DESKO_GUARD_CONFIG") ??
-                            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Desko", "config.json");
-            if (File.Exists(config) && JsonNode.Parse(File.ReadAllText(config)) is JsonObject root)
-            {
-                bool changed = false, refresh = false;
+                            Path.Combine(Environment.GetEnvironmentVariable("DESKO_DATA_DIR") ??
+                                         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Desko"), "config.json");
+            if (!File.Exists(config) || JsonNode.Parse(File.ReadAllText(config)) is not JsonObject root) return;
 
-                if (root["VirtualIcons"] is JsonArray virtualIcons)
-                    foreach (var v in virtualIcons)
-                        if (v?["Clsid"]?.GetValue<string>() is string clsid) refresh |= ShowDesktopIcon(clsid);
+            bool parked = root["IconsParked"]?.GetValue<bool>() == true;
+            bool iconsOff = root["IconsHiddenByUs"]?.GetValue<bool>() == true;
+            bool legacy = root["HiddenByUs"] is JsonArray { Count: > 0 } || root["VirtualIcons"] is JsonArray { Count: > 0 };
+            if (!parked && !iconsOff && !legacy) return; // a clean exit
 
-                if (root["HiddenByUs"] is JsonArray hidden && hidden.Count > 0)
-                {
-                    foreach (var h in hidden)
-                        if (h?.GetValue<string>() is string path) Unhide(path);
-                    root["HiddenByUs"] = new JsonArray();
-                    changed = true;
-                }
-
-                if (root["IconsHiddenByUs"]?.GetValue<bool>() == true)
-                {
-                    ShowDesktopIconView();
-                    root["IconsHiddenByUs"] = false;
-                    changed = true;
-                }
-
-                if (refresh) RefreshDesktop();
-                if (changed)
-                {
-                    string tmp = config + ".tmp";
-                    File.WriteAllText(tmp, root.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
-                    File.Move(tmp, config, true);
-                }
-            }
-
-            using var run = Registry.CurrentUser.OpenSubKey(RunKey, writable: true);
-            run?.DeleteValue("DeskoRestore", false);
+            // The icons themselves first: that much works even without the app.
+            if (iconsOff) ShowDesktopIconView();
+            string app = Path.Combine(AppContext.BaseDirectory, "Desko.exe");
+            if (File.Exists(app))
+                Process.Start(new ProcessStartInfo(app, "--restore") { UseShellExecute = false, CreateNoWindow = true });
         }
 
-        static void Unhide(string path)
-        {
-            try
-            {
-                if (!File.Exists(path) && !Directory.Exists(path)) return;
-                var attrs = File.GetAttributes(path);
-                if ((attrs & FileAttributes.Hidden) == 0) return;
-                File.SetAttributes(path, attrs & ~FileAttributes.Hidden);
-                SHChangeNotify(SHCNE_ATTRIBUTES, SHCNF_PATHW | SHCNF_FLUSHNOWAIT, path, IntPtr.Zero);
-            }
-            catch (Exception) { }
-        }
-
-        static bool ShowDesktopIcon(string clsid)
-        {
-            using var key = Registry.CurrentUser.OpenSubKey(HideIconsKey, writable: true);
-            if (key?.GetValue(clsid) is not int value || value == 0) return false;
-            key.SetValue(clsid, 0, RegistryValueKind.DWord);
-            return true;
-        }
-
-        static IntPtr FindDefView()
+        static void ShowDesktopIconView()
         {
             IntPtr dv = FindWindowEx(FindWindow("Progman", null), IntPtr.Zero, "SHELLDLL_DefView", null);
             for (IntPtr w = FindWindowEx(IntPtr.Zero, IntPtr.Zero, "WorkerW", null); dv == IntPtr.Zero && w != IntPtr.Zero;
                  w = FindWindowEx(IntPtr.Zero, w, "WorkerW", null))
                 dv = FindWindowEx(w, IntPtr.Zero, "SHELLDLL_DefView", null);
-            return dv;
-        }
-
-        static void ShowDesktopIconView()
-        {
-            IntPtr dv = FindDefView();
             IntPtr lv = dv == IntPtr.Zero ? IntPtr.Zero : FindWindowEx(dv, IntPtr.Zero, "SysListView32", null);
             if (lv != IntPtr.Zero && !IsWindowVisible(lv))
                 PostMessage(dv, WM_COMMAND, new IntPtr(CmdToggleDesktopIcons), IntPtr.Zero);
-        }
-
-        static void RefreshDesktop()
-        {
-            SHChangeNotify(SHCNE_ASSOCCHANGED, 0, null, IntPtr.Zero);
-            IntPtr dv = FindDefView();
-            IntPtr lv = dv == IntPtr.Zero ? IntPtr.Zero : FindWindowEx(dv, IntPtr.Zero, "SysListView32", null);
-            if (lv != IntPtr.Zero) PostMessage(lv, WM_KEYDOWN, new IntPtr(VK_F5), IntPtr.Zero);
         }
     }
 }

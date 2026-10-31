@@ -11,7 +11,7 @@ using Microsoft.Win32;
 namespace Desko.Shell
 {
     // Items without a file behind them (Recycle Bin, This PC, Start-menu apps...): they arrive as a
-    // "Shell IDList Array" only, so the fence stores a shortcut to them instead.
+    // "Shell IDList Array" only. Desktop icons among them join a fence as they are; others get a shortcut.
     internal static class VirtualItems
     {
         public const string IdListFormat = "Shell IDList Array";
@@ -75,6 +75,17 @@ namespace Desko.Shell
                 return null;
             try { return Marshal.PtrToStringUni(ptr); }
             finally { Marshal.FreeCoTaskMem(ptr); }
+        }
+
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+        static extern int SHParseDisplayName(string name, IntPtr bindCtx, out IntPtr pidl, uint sfgaoIn, out uint sfgaoOut);
+
+        // "Recycle Bin" for "shell:::{645FF040-...}", in the language of Windows.
+        public static string? DisplayName(string shellPath)
+        {
+            if (SHParseDisplayName(shellPath, IntPtr.Zero, out var pidl, 0, out _) != 0) return null;
+            try { return GetName(pidl, parsing: false); }
+            finally { Marshal.FreeCoTaskMem(pidl); }
         }
 
         // "{645FF040-...}" when the item is one of the standard desktop icons, else null.

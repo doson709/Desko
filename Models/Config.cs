@@ -18,7 +18,8 @@ namespace Desko.Models
         public string GroupId { get; set; } = "";
         public bool ActiveTab { get; set; }
 
-        // Normal fences list Desktop items by name (Members); portals show FolderPath.
+        // Normal fences hold desktop icons, listed by the name the Desktop folder gives them (a file name, or
+        // "::{CLSID}" for Recycle Bin, This PC...); portals show FolderPath.
         public bool IsPortal { get; set; }
         public string FolderPath { get; set; } = "";
         public List<string> Members { get; set; } = new();
@@ -34,7 +35,7 @@ namespace Desko.Models
         // "#RRGGBB", "auto" (follows Windows light/dark) or "accent" (the Windows accent colour).
         public string Color { get; set; } = "auto";
         public double Opacity { get; set; } = 0.4;
-        // 0 = same size as the desktop's icons.
+        // Folder portals only (normal fences show the desktop's own icons): 0 = same size as the desktop's icons.
         public int IconSize { get; set; }
         public SortMode SortMode { get; set; } = SortMode.Custom;
         public List<string> Order { get; set; } = new();
@@ -45,8 +46,10 @@ namespace Desko.Models
     {
         public bool FirstRunDone { get; set; }
         public bool DoubleClickToHide { get; set; } = true;
-        public bool HideIconsToo { get; set; } = true;
         public bool RightDragToCreate { get; set; } = true;
+        // Icons dropped on the desktop outside any fence snap to the icon grid (Windows' own "Align icons to
+        // grid" has to stay off, or it would also snap the icons inside fences).
+        public bool AlignLooseIcons { get; set; } = true;
         public bool AutoApplyRules { get; set; }
         public bool SingleClickOpen { get; set; }
         public bool SnapToGrid { get; set; } = true;
@@ -61,11 +64,26 @@ namespace Desko.Models
         // Fences created before "follow the desktop icon size" existed were fixed at 48; switch them over once.
         public bool FollowDesktopIconSizeMigrated { get; set; }
 
-        // Desktop items we set the Hidden attribute on; persisted so a crash never strands them.
+        // 3 = fences hold the real desktop icons. Version 2 hid fenced files (HiddenByUs) and stood in for
+        // Recycle Bin & co. with shortcuts (VirtualIcons); both are only read to undo that once.
+        public int LayoutVersion { get; set; }
         public List<string> HiddenByUs { get; set; } = new();
-
-        // Standard desktop icons (Recycle Bin, This PC...) moved into a fence as a shortcut.
         public List<VirtualIcon> VirtualIcons { get; set; } = new();
+
+        // Some icons are parked off screen (rolled-up fences, other tabs, rows scrolled away). Written before
+        // parking, so a crash or power loss still gets them back (see Recovery).
+        public bool IconsParked { get; set; }
+
+        // The desktop's "Auto arrange icons" (1) and "Align icons to grid" (2) before Desko switched them off;
+        // given back on uninstall.
+        public int? DesktopArrangeBefore { get; set; }
+
+        // Icons outside the fences kept packed in columns, as Windows' "Auto arrange icons" did (which itself has to
+        // stay off). Unset: on if the desktop had "Auto arrange icons" on before Desko.
+        public bool? AutoArrangeLoose { get; set; }
+
+        [JsonIgnore]
+        public bool ArrangesLooseIcons => AutoArrangeLoose ?? (DesktopArrangeBefore is int before && (before & 1) != 0);
 
         public List<FenceConfig> Fences { get; set; } = new();
 
@@ -89,7 +107,8 @@ namespace Desko.Models
 
     internal static class ConfigStore
     {
-        public static readonly string AppDataDir =
+        // Overridable only so tests can run with a scratch configuration instead of the real one.
+        public static readonly string AppDataDir = Environment.GetEnvironmentVariable("DESKO_DATA_DIR") ??
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Desko");
 
         public static readonly string ConfigPath = Path.Combine(AppDataDir, "config.json");
@@ -134,6 +153,36 @@ namespace Desko.Models
     internal static class Log
     {
         static readonly object Gate = new();
+
+        // Diagnostic timeline (trace.log): queued from any thread, even the mouse hook, and written in the background.
+        static readonly System.Collections.Concurrent.ConcurrentQueue<string> Pending = new();
+        static System.Threading.Timer? _flusher;
+        static readonly System.Diagnostics.Stopwatch Clock = System.Diagnostics.Stopwatch.StartNew();
+
+        public static void Trace(string text)
+        {
+            Pending.Enqueue($"{DateTime.Now:HH:mm:ss.fff} +{Clock.ElapsedMilliseconds,7} {text}");
+            _flusher ??= new System.Threading.Timer(_ => FlushTrace(), null, 300, 300);
+        }
+
+        static void FlushTrace()
+        {
+            if (Pending.IsEmpty) return;
+            var sb = new System.Text.StringBuilder();
+            while (Pending.TryDequeue(out var line)) sb.AppendLine(line);
+            try
+            {
+                lock (Gate)
+                {
+                    Directory.CreateDirectory(ConfigStore.AppDataDir);
+                    string path = Path.Combine(ConfigStore.AppDataDir, "trace.log");
+                    if (File.Exists(path) && new FileInfo(path).Length > 2 * 1024 * 1024)
+                        File.Move(path, Path.Combine(ConfigStore.AppDataDir, "trace.old.log"), true);
+                    File.AppendAllText(path, sb.ToString());
+                }
+            }
+            catch { }
+        }
 
         public static void Error(Exception? ex)
         {
